@@ -1086,11 +1086,10 @@ class TaskCollator:
         device  : Target device for tensors. None = keep on CPU.
     """
 
-    def __init__(self, n_way, k_shot, q_query, device=None):
+    def __init__(self, n_way, k_shot, q_query):
         self.n_way   = n_way
         self.k_shot  = k_shot
         self.q_query = q_query
-        self.device  = device
 
     def __call__(self, batch):
         imgs     = torch.stack([item[0] for item in batch])
@@ -1098,11 +1097,6 @@ class TaskCollator:
         support  = reshaped[:, :self.k_shot]
         query    = reshaped[:, self.k_shot:]
         target   = torch.arange(self.n_way).repeat_interleave(self.q_query)
-
-        if self.device:
-            support = support.to(self.device)
-            query   = query.to(self.device)
-            target  = target.to(self.device)
 
         return {
             "support": support,
@@ -1343,8 +1337,7 @@ class SmartDataLoaderFactory:
         collator = TaskCollator(
             n_way   = n,
             k_shot  = k,
-            q_query = q,
-            device  = self.device
+            q_query = q
         )
 
         return DataLoader(

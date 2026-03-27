@@ -335,8 +335,8 @@ def run_smoke_test3(loader_factory, device, num_workers=0):
     try:
         loader = loader_factory.get_loader(
             pool_name='novel', mode='episodic',
-            n_way=5, k_shot=1, q_query=5,
-            n_episodes=3, num_workers=num_workers,
+            n=5, k=1, q=5,
+            iterations=3, num_workers=num_workers,
         )
         batch   = next(iter(loader))
         support = batch['support']
