@@ -362,8 +362,7 @@ class LightningModuleWrapper:
                  factory,
                  state:     'TrainingState',
                  history:   'TrainingHistory',
-                 ckpt_path: str,
-                 impl:      'TrainerImpl' = None):
+                 ckpt_path: str):
         try:
             import lightning as L
             self._L = L
@@ -379,7 +378,6 @@ class LightningModuleWrapper:
         self.state     = state
         self.history   = history
         self.ckpt_path = ckpt_path
-        self.impl      = impl      # TrainerImpl ref — for writing _pretrain_best_path
 
     def build_and_fit(self):
         """
@@ -521,12 +519,7 @@ class LightningModuleWrapper:
             _MF.save(self.model, mf_path)
             os.remove(lightning_ckpt_path)   # .ckpt no longer needed
 
-        # Write working ckpt path directly to TrainerImpl instance var.
-        # impl is always set when called from _pretrain_lightning().
-        # TrainingState holds no internal paths — only export paths.
-        if self.impl is not None:
-            self.impl._pretrain_best_path = mf_path
-        state.epoch                  = lt.current_epoch
+        state.epoch = lt.current_epoch
 
         # Populate history from Lightning CSV log
         csv_path = os.path.join(logger.log_dir, 'metrics.csv')
@@ -535,11 +528,14 @@ class LightningModuleWrapper:
 
         print(f"  Pretrain complete. Best val_loss: {state.best_val_loss:.4f}")
         
-        #cleanup of logger
-        log_dir = logger.log_dir          # .../run_id_pretrain_logs/version_0
-        root_log_dir = os.path.dirname(os.path.dirname(log_dir))  # .../run_id_pretrain_logs
-        if os.path.exists(root_log_dir):
-            shutil.rmtree(root_log_dir)
+        # Cleanup Lightning logs dir — one level up from version_0 only
+        logs_root = os.path.dirname(logger.log_dir)   # .../run_id_pretrain_logs
+        if os.path.exists(logs_root):
+            shutil.rmtree(logs_root)
+            print(f"  [Lightning] Logs cleaned: {logs_root}")
+
+        return mf_path
+
 
 
     def _sync_history_from_csv(self, csv_path: str,
@@ -1018,10 +1014,25 @@ class TrainerImpl:
             factory   = self.factory,
             state     = self.state,
             history   = self.history,
-            ckpt_path = ckpt_path,
-            impl      = self            # gives wrapper direct write access to _pretrain_best_path
+            ckpt_path = ckpt_path
         )
-        wrapper.build_and_fit()
+
+        mf_path = wrapper.build_and_fit()
+        if not mf_path:
+            raise RuntimeError(
+                f"Lightning pretrain failed to produce checkpoint. "
+                f"Expected .pt at: {ckpt_path}.pt"
+            )
+        if not os.path.exists(mf_path):
+            raise RuntimeError(
+                f"Lightning pretrain checkpoint not found after save. "
+                f"Expected: {mf_path}. "
+                f"Dir contents: {os.listdir(self.config.checkpoint_dir)}"
+            )
+
+        self._pretrain_best_path = mf_path
+        print(f"  [Lightning] _pretrain_best_path = '{mf_path}'")
+
 
     def _run_train_lightning(self):
         """
@@ -1124,6 +1135,7 @@ class TrainerImpl:
 
         # 1. Load best weights into live model
         ModelFactory.load(self.model, path)
+        self.model.to(self.device)
 
         # 2 + 3. Handle file and set export path
         mode = self.config.pretrain_save_mode
@@ -1173,6 +1185,7 @@ class TrainerImpl:
 
         # 1. Load best weights into live model
         ModelFactory.load(self.model, path)
+        self.model.to(self.device)
 
         # 2 + 3. Handle file and set export path
         if self.config.keep_final:
