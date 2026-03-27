@@ -514,7 +514,8 @@ class LightningModuleWrapper:
         if lightning_ckpt_path and os.path.exists(lightning_ckpt_path):
             import torch as _torch
             from model_factory import ModelFactory as _MF
-            lightning_ckpt = _torch.load(lightning_ckpt_path, map_location='cpu')
+            device = next(self.model.parameters()).device   # ← get model device
+            lightning_ckpt = _torch.load(lightning_ckpt_path, map_location=device)
             lm.load_state_dict(lightning_ckpt['state_dict'])
             mf_path = lightning_ckpt_path.replace('.ckpt', '.pt')
             _MF.save(self.model, mf_path)
