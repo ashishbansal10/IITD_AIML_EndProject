@@ -569,7 +569,8 @@ class ExperimentRunner:
 
         # ── Print summary ────────────────────────────────────────────
         # Model memory snapshot
-        mem_mb = torch.cuda.memory_allocated(self.device)/1024/1024 if self.device.type == 'cuda' else 0)
+        mem_mb  = (torch.cuda.memory_allocated(self.device) / 1024 / 1024
+                   if self.device.type == 'cuda' else 0)
         total_p  = sum(p.numel() for p in model.parameters())
         elapsed  = (end_time - start_time) / 60
         print(f"\n  {run_cfg.run_id} DONE | "
