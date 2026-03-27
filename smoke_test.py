@@ -319,7 +319,7 @@ def run_smoke_test3(loader_factory, device, num_workers=0):
     print("\n  Batch loader (pretrain pool):")
     try:
         loader = loader_factory.get_loader(
-            pool='pretrain', mode='batch',
+            pool_name='pretrain', mode='batch',
             batch_size=8, num_workers=num_workers, shuffle=False,
         )
         imgs, labels = next(iter(loader))
@@ -334,7 +334,7 @@ def run_smoke_test3(loader_factory, device, num_workers=0):
     print("\n  Episodic loader (novel pool, 5-way 1-shot 5-query):")
     try:
         loader = loader_factory.get_loader(
-            pool='novel', mode='episodic',
+            pool_name='novel', mode='episodic',
             n_way=5, k_shot=1, q_query=5,
             n_episodes=3, num_workers=num_workers,
         )

@@ -121,76 +121,46 @@ model.freeze_by_role('head')          # by role — all head components
 model.freeze_all_except('backbone')   # by exclusion
 model.unfreeze_by_role('backbone')    # unfreeze by role
 
-Notes — Pending / Future / Design Decisions
 -------------------------------------------
-[CONFIRMED] Conv4, ResNet12 — NO pretrained weights loaded.
-            easyfsl resnet12() and conv4() constructors use random init.
-            Pretrained FEAT weights exist in easyfsl but require manual
-            download — not loaded automatically. Safe for this project.
+Notes — Design Decisions & Status
+-------------------------------------------
 
-[CONFIRMED] easyfsl resnet12() and conv4() accept NO HP kwargs — fixed arch.
-            dropout_rate applied as nn.Dropout wrapper after backbone output.
-            drop_rate (DropBlock) not configurable via easyfsl — internal default.
+[DONE] Conv4, ResNet12 — random init only, no pretrained weights.
+       dropout_rate applied as nn.Dropout wrapper post-backbone.
 
-[CONFIRMED] bias=True fixed in Linear — final classification layer, no BN after.
-            bias removal only meaningful when BatchNorm follows — not applicable here.
+[DONE] PrototypicalNet — n_way/k_shot set via ModelConfig, not trainer.
+       Trainer computes embeddings, passes to mode='prototypical'.
 
-[CONFIRMED] PrototypicalNet n_way/k_shot/q_query set via ModelConfig at init.
-            These are protocol config — not HP tunable, not passed by trainer.
-            CompositeModel has zero knowledge of episodic protocol.
-            Trainer computes embeddings via mode='embedding', passes to mode='prototypical'.
+[DONE] GATRelationalLayer — k-NN graph + GATConv + residual connection.
+       Episode-aware: trainer/evaluator pass support+query together.
+       Requires: torch-cluster>=1.6.3
 
-[CONFIRMED] 'input' node in graph is a reserved tensor slot — not a component.
-            Raw normalized tensor assigned directly from DataLoader.
-            Normalization handled by TransformedPoolDataset transforms.
+[DONE] GNNBackbone — CNN stem (no global pool) → 100 nodes → GCNConv×3
+       → global mean pool → [B, 640]. Grid edges precomputed as buffer.
 
-[CONFIRMED] pretrained=False set for timm via _TimmWrapper.
-            easyfsl resnet12()/conv4() have no pretrained argument —
-            always random init by design.
-            torchvision models if added later must use weights=None (v0.13+).
+[DONE] TrainingState — pretrain_best_val_acc / pretrain_best_val_loss
+       preserved separately before train phase resets best metrics.
 
-[CONFIRMED] _TimmWrapper — not used by any current registered component.
-            Acts as fallback for future timm model names via registry.
+[DONE] validate_and_stamp() — deepcopies train/eval configs before stamping.
+       Safe for shared configs across ExperimentConfigs.
 
-[CONFIRMED] 'name' key in trainable_param_groups — for debugging only.
-            PyTorch optimizer passes unknown keys through silently.
-            Safe for Adam, SGD. Verify with other optimizers before use.
+[DONE] PICKLE_SPLIT_KEYWORDS — train_phase_test/val skipped (None).
+       Clean 60,000 sample standard benchmark split preserved.
 
-[PLACEHOLDER] GATRelationalLayer.forward() — identity pass-through.
-              Full PyG k-NN graph + GAT implementation — Phase 6.
+[DONE] TuneConfig.proxy_epochs — overrides hardcoded max(10,...) in tuner.
 
-[PLACEHOLDER] GNNBackbone.forward() — returns zeros.
-              Full PyG GCN implementation — Phase 6.
-
-[PENDING] GATRelationalLayer + GNNBackbone full HP in Phase 6.
-          n_heads, attention_dropout, k_neighbours, n_layers via PyG kwargs.
-
-[PENDING] ComponentModel._apply_hp() — re-applies HP to internal layers
-          after set_hp() call. Currently no-op in most subclasses.
-          Conv4, ResNet12, Linear implement _apply_hp()
-          for dropout_rate. Others pending.
-
-[PENDING] ModelConfig.from_hydra(cfg) — add when Hydra integrated.
-          OmegaConf.DictConfig → plain dict conversion needed.
+[PENDING] ComponentModel._apply_hp() — re-applies HP after set_hp().
+          Currently no-op in most subclasses.
 
 [PENDING] ModelFactory.load() — add device consistency check.
-          Verify checkpoint device matches model device before load.
+
+[FUTURE] ModelConfig.from_hydra(cfg) — when Hydra integrated.
 
 [FUTURE] Replace _execute_graph() with torch.fx GraphModule.
-         Only CompositeModel._execute_graph() changes — nothing else affected.
-
-[FUTURE] ComponentRegistry swap: unregister('resnet12') + re-register
-         to swap easyfsl → learn2learn or custom implementation.
-
-[FUTURE] ModelConfig __eq__ and __hash__ for config comparison
-         and experiment deduplication.
 
 [FUTURE] PrototypicalNet distance_metric='cosine' — stub present, not implemented.
-[FUTURE] detach(name) / attach(name, component, role). 
-         Useful for: fine-tuning on novel classes, multi-task head swapping
-         Not needed for current 6 runs — freeze + mode routing sufficient
 
-device passed from notebook — never auto-detected inside any class.
+[FUTURE] detach()/attach() — component hot-swap for novel class fine-tuning.
 """
 
 import os
@@ -199,6 +169,9 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GATConv
+from torch_geometric.nn import knn_graph
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Union, Any
 
@@ -1021,7 +994,6 @@ class GATRelationalLayer(ComponentModel):
         self.k_neighbours = k_neighbours
  
         try:
-            from torch_geometric.nn import GATConv
             # out_channels per head = embed_dim // n_heads
             # concat=True → output = out_channels * n_heads = embed_dim
             # This preserves output_dim = embed_dim for the residual to work.
@@ -1058,9 +1030,7 @@ class GATRelationalLayer(ComponentModel):
         """
         if not self._available:
             return x   # identity fallback if PyG not installed
- 
-        from torch_geometric.nn import knn_graph
- 
+  
         B = x.size(0)
  
         # Safe k — can't have more neighbours than other nodes
@@ -1193,7 +1163,6 @@ class GNNBackbone(ComponentModel):
  
         # ── GCN message passing layers ─────────────────────────────────
         try:
-            from torch_geometric.nn import GCNConv
             self.convs = nn.ModuleList([
                 GCNConv(embed_dim, embed_dim) for _ in range(n_layers)
             ])
@@ -1247,6 +1216,10 @@ class GNNBackbone(ComponentModel):
                             src.append(node)
                             dst.append(nb)
         return torch.tensor([src, dst], dtype=torch.long)
+
+    @property
+    def output_dim(self) -> int:
+        return self._out_dim
  
     # ------------------------------------------------------------------
     # Forward
@@ -1299,6 +1272,7 @@ class GNNBackbone(ComponentModel):
         # ── Step 6: Global mean pool per image ────────────────────────
         feat = feat.view(B, self._nodes_per_image, self.embed_dim)
         return feat.mean(dim=1)                # [B, embed_dim]
+
 
 
 # ==============================================================================
