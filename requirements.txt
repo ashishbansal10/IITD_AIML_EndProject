@@ -1,0 +1,37 @@
+# -- basic -- 
+ipykernel
+ipywidgets
+jupyterlab_widgets
+
+# --- Core Data Stack ---
+numpy
+scipy
+pandas
+
+# --- Classical Machine Learning ---
+scikit-learn
+xgboost
+statsmodels
+
+# --- Deep Learning (Verified 2026 Lock-step) ---
+datasets
+torch>=2.0.0
+torchvision>=0.15.0
+torch-geometric>=2.3.0
+timm>=0.9.0
+pytorch-lightning>=2.0.0
+lightning>=2.0.0
+easyfsl>=1.4.0
+pyyaml>=6.0.0
+hydra-core>=1.3.0
+optuna>=3.0.0
+
+
+
+
+# --- Visualization & Media ---
+matplotlib
+seaborn
+tqdm>=4.0.0
+ffmpeg-python>=0.2.0
+ffmpeg-binaries>=1.1.0
