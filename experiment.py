@@ -840,3 +840,174 @@ class Plotter:
 
         print(f"{'='*len(header)}")
         print(f"← primary metric: novel class generalization\n")
+
+    def print_results_table(runner, save_path='results/results_table.html'):
+        """
+        Prints a styled HTML results table for all 6 runs.
+        Suitable for copy-paste into MS Word / project report.
+
+        Columns:
+            Arch | Paradigm | Pretrain Eval | Softmax | Proto Seen |
+            Proto Novel | 95% CI | Time (min) | [Best HPs if show_hps=True]
+
+        Highlighting:
+            Green  = best value in column
+            Red    = worst value in column
+            Time   = green for fastest, red for slowest
+            CI     = text only, no highlight
+        """
+        import os
+        import pandas as pd
+        from IPython.display import display, HTML
+
+        show_hps = any(r.best_hps is not None for r in runner.run_results.values())
+
+        # ── Build rows ────────────────────────────────────────────────────
+        rows = []
+        for run_id, result in runner.run_results.items():
+            ts  = result.training_state
+            rs  = result.run_scores
+
+            def acc(key, field='top1_acc'):
+                s = rs.get(key, {})
+                v = s.get(field) if isinstance(s, dict) else None
+                return round(v * 100, 2) if v is not None else None
+
+            novel_lo = rs.get('trained_proto_novel', {}).get('ci_lower')
+            novel_hi = rs.get('trained_proto_novel', {}).get('ci_upper')
+            ci_str   = (f"{novel_lo*100:.2f} – {novel_hi*100:.2f}"
+                        if novel_lo is not None else '—')
+
+            row = {
+                'Arch'            : result.arch.upper(),
+                'Paradigm'        : result.paradigm.capitalize(),
+                'Pretrain Eval %' : acc('pretrain_softmax'),
+                'Softmax %'       : acc('trained_softmax'),
+                'Proto Seen %'    : acc('trained_proto_seen'),
+                'Proto Novel %'   : acc('trained_proto_novel'),
+                '95% CI'          : ci_str,
+                'Time (min)'      : int(round(result.duration_seconds / 60, 0)),
+            }
+
+            if show_hps and result.best_hps:
+                row['Best HPs'] = str(result.best_hps)
+
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+
+        # ── Highlight helpers ─────────────────────────────────────────────
+        highlight_high = ['Pretrain Eval %', 'Softmax %', 'Proto Seen %', 'Proto Novel %']
+        highlight_low  = ['Time (min)']   # lower is better
+
+        GREEN_BG  = 'background-color: #c6efce; color: #276221; font-weight: bold'
+        RED_BG    = 'background-color: #ffc7ce; color: #9c0006; font-weight: bold'
+        BOLD      = 'font-weight: bold'
+        NORMAL    = ''
+
+        def highlight_col(col):
+            styles = [NORMAL] * len(col)
+            numeric = col.dropna()
+            if col.name in highlight_high and len(numeric):
+                best  = numeric.max()
+                worst = numeric.min()
+                for i, v in enumerate(col):
+                    if v == best:  styles[i] = GREEN_BG
+                    elif v == worst: styles[i] = RED_BG
+            elif col.name in highlight_low and len(numeric):
+                best  = numeric.min()
+                worst = numeric.max()
+                for i, v in enumerate(col):
+                    if v == best:  styles[i] = GREEN_BG
+                    elif v == worst: styles[i] = RED_BG
+            return styles
+
+        def highlight_text_cols(col):
+            if col.name in ['Arch', 'Paradigm']:
+                return [BOLD] * len(col)
+            return [NORMAL] * len(col)
+
+        # ── Build styler ──────────────────────────────────────────────────
+        fmt = {
+            'Pretrain Eval %' : '{:.2f}',
+            'Softmax %'       : '{:.2f}',
+            'Proto Seen %'    : '{:.2f}',
+            'Proto Novel %'   : '{:.2f}',
+            'Time (min)'      : '{:.0f}',
+        }
+        if show_hps:
+            fmt['Best HPs'] = '{}'
+
+        styled = (
+            df.style
+            .apply(highlight_col,      axis=0)
+            .apply(highlight_text_cols, axis=0)
+            .format(fmt, na_rep='—')
+            .set_caption('Table: Few-Shot Classification Results — Mini-ImageNet (5-way 5-shot)')
+            .set_table_styles([
+                # Table overall
+                {'selector': 'table',
+                'props': [('border-collapse', 'collapse'),
+                            ('font-family', 'Calibri, Arial, sans-serif'),
+                            ('font-size', '13px'),
+                            ('width', '100%')]},
+                # Caption
+                {'selector': 'caption',
+                'props': [('font-size', '13px'),
+                            ('font-weight', 'bold'),
+                            ('text-align', 'left'),
+                            ('padding-bottom', '6px'),
+                            ('color', '#1a1a1a')]},
+                # Header row
+                {'selector': 'thead tr th',
+                'props': [('background-color', '#1f4e79'),
+                            ('color', 'white'),
+                            ('font-weight', 'bold'),
+                            ('text-align', 'center'),
+                            ('padding', '8px 10px'),
+                            ('border', '1px solid #aaa')]},
+                # Data cells
+                {'selector': 'td',
+                'props': [('text-align', 'center'),
+                            ('padding', '6px 10px'),
+                            ('border', '1px solid #ddd')]},
+                # Arch + Paradigm cols — left align
+                {'selector': 'td:nth-child(1), td:nth-child(2)',
+                'props': [('text-align', 'left'),
+                            ('font-weight', 'bold')]},
+                # Alternating row shading
+                {'selector': 'tbody tr:nth-child(even)',
+                'props': [('background-color', '#f2f2f2')]},
+                {'selector': 'tbody tr:hover',
+                'props': [('background-color', '#e8f0fe')]},
+            ])
+            .hide(axis='index')
+        )
+
+        # ── Display ───────────────────────────────────────────────────────
+        display(styled)
+
+        # ── Save HTML ─────────────────────────────────────────────────────
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.',
+                    exist_ok=True)
+        html_str = styled.to_html()
+        with open(save_path, 'w') as f:
+            f.write(f"""<!DOCTYPE html>
+                    <html>
+                    <head>
+                    <meta charset='utf-8'>
+                    <title>Results Table</title>
+                    <style>
+                    body {{ font-family: Calibri, Arial, sans-serif; padding: 20px; }}
+                    </style>
+                    </head>
+                    <body>
+                    {html_str}
+                    </body>
+                    </html>""")
+        print(f"Saved: {save_path}")
+
+        # ── Also save CSV for report ───────────────────────────────────────
+        csv_path = save_path.replace('.html', '.csv')
+        df.to_csv(csv_path, index=False)
+        print(f"Saved: {csv_path}")
