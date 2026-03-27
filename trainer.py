@@ -149,6 +149,10 @@ class TrainConfig:
     backend_pretrain: str = 'lightning'
     backend_train:    str = 'pytorch'
 
+    # ── Verbose ───────────────────────────────────────────────────────
+    verbose: bool = True   # True = print every epoch + tqdm (smoke/debug)
+                           # False = phase summary only (real experiment runs)
+
     # ── Optimizer ─────────────────────────────────────────────────────
     # Per-component lr override for trainable_param_groups
     # e.g. {'backbone': 1e-4, 'linear': 1e-3}
@@ -491,11 +495,6 @@ class LightningModuleWrapper:
         )
 
         lm = _PretrainModule()
-
-        print(f"\n{'='*60}")
-        print(f"PRETRAIN [Lightning] — {config.epochs_pretrain} epochs")
-        print(f"{'='*60}")
-
         lt.fit(lm, pretrain_loader, val_loader)
 
         # ── Sync metrics back to state and history ────────────────────
@@ -650,6 +649,8 @@ class TrainerImpl:
         # Never stored in TrainingState — TrainingState holds only export paths.
         self._pretrain_best_path: str = ''
         self._train_best_path:    str = ''
+        self._phase_start_time: float = 0.0   # wall clock per phase
+        self._best_epoch:       int   = 0     # epoch where best checkpoint was saved
 
         self.validate()
 
@@ -679,6 +680,23 @@ class TrainerImpl:
     # Public dispatch — routes to backend
     # ------------------------------------------------------------------
 
+    def _model_summary_line(self) -> str:
+        """Returns one-line model summary: params + estimated size in MB."""
+        total  = sum(p.numel() for p in self.model.parameters())
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        # Estimate size: assume float32 (4 bytes) for params
+        size_mb = total * 4 / 1024 / 1024
+        return (f"  params={total/1e6:.2f}M  trainable={trainable/1e6:.2f}M  "
+                f"est_size={size_mb:.1f}MB")
+
+    def _gpu_memory_mb(self) -> float:
+        """Returns current GPU memory allocated in MB, or 0 on CPU."""
+        if self.device.type == 'cuda':
+            return torch.cuda.memory_allocated(self.device) / 1024 / 1024
+        return 0.0
+
+    # ------------------------------------------------------------------
+
     def pretrain(self):
         """
         Phase 1 — shared pretrain for both paradigms.
@@ -689,6 +707,9 @@ class TrainerImpl:
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         self.state.reset_early_stop()
         self.state.epoch = 0
+
+        backend_label = self.config.backend_pretrain
+        print(f"\n  Phase 1: Pretrain [{backend_label} | {self.config.epochs_pretrain} epochs]")
 
         if self.config.backend_pretrain == 'pytorch':
             self._pretrain_pytorch()
@@ -707,6 +728,8 @@ class TrainerImpl:
         """
         self.state.reset_early_stop()
         self.state.epoch = 0
+
+        print(f"\n  Phase 2: Train [standard | {self.config.backend_train} | {self.config.epochs_train} epochs]")
 
         if self.config.backend_train == 'pytorch':
             self._run_train_pytorch(
@@ -730,6 +753,8 @@ class TrainerImpl:
         """
         self.state.reset_early_stop()
         self.state.epoch = 0
+
+        print(f"\n  Phase 2: Train [fewshot | {self.config.backend_train} | {self.config.episodes_train} eps/epoch | {self.config.epochs_train} epochs]")
 
         # Freeze linear head — episodic training does not update it
         self.model.freeze('linear')
@@ -776,12 +801,12 @@ class TrainerImpl:
             num_workers = self.config.num_workers
         )
 
-        print(f"\n{'='*60}")
-        print(f"PRETRAIN — {self.config.epochs_pretrain} epochs")
-        print(f"{'='*60}")
+        self._phase_start_time = time.time()
+        epochs_run = 0
 
         for epoch in range(self.config.epochs_pretrain):
             self.state.epoch = epoch
+            epochs_run = epoch + 1
 
             train_loss, train_acc = self._batch_epoch(pretrain_loader, optimizer, is_train=True)
             val_loss, val_acc = self._batch_epoch(val_loader, optimizer=None, is_train=False)
@@ -790,22 +815,29 @@ class TrainerImpl:
                 scheduler.step()
 
             self.history.log_pretrain(epoch, train_loss, train_acc, val_loss, val_acc)
-            self._log_epoch('pretrain', epoch, train_loss, train_acc, val_loss, val_acc)
+            if self.config.verbose:
+                self._log_epoch('pretrain', epoch, train_loss, train_acc, val_loss, val_acc)
 
             # Checkpoint on improvement
             if self._is_improved(val_loss, val_acc):
                 path = os.path.join( self.config.checkpoint_dir, f"{self.config.run_id}_pretrain_best.pt" )
                 self._save_checkpoint(path)
-                self._pretrain_best_path = path   # latest best-epoch pretrain path
+                self._pretrain_best_path = path
+                self._best_epoch = epoch
                 self.state.early_stop_counter = 0
             else:
                 self.state.early_stop_counter += 1
 
             if self._early_stopping_check():
-                print(f"  Early stopping at epoch {epoch}")
+                if self.config.verbose:
+                    print(f"  Early stopping at epoch {epoch}")
                 break
 
-        print(f"  Pretrain complete. Best val_loss: {self.state.best_val_loss:.4f}")
+        elapsed = (time.time() - self._phase_start_time) / 60
+        print(f"  Pretrain — ran {epochs_run}/{self.config.epochs_pretrain} epochs  "
+              f"best @ epoch {self._best_epoch}  "
+              f"val_loss={self.state.best_val_loss:.2f}  val_acc={self.state.best_val_acc:.2f}  "
+              f"time={elapsed:.1f}min")
 
     # ------------------------------------------------------------------
     # PyTorch — train (batch or episodic)
@@ -850,12 +882,15 @@ class TrainerImpl:
             )
 
         mode_str = 'episodic' if episodic else 'batch'
-        print(f"\n{'='*60}")
-        print(f"TRAIN [{mode_str}] — {self.config.epochs_train} epochs")
-        print(f"{'='*60}")
+        unit_str = f"{self.config.episodes_train} eps/epoch" if episodic else "batch"
+
+        self._phase_start_time = time.time()
+        self._best_epoch = 0
+        epochs_run = 0
 
         for epoch in range(self.config.epochs_train):
             self.state.epoch = epoch
+            epochs_run = epoch + 1
 
             if episodic:
                 # Set epoch for EpisodicBatchSampler RNG variation
@@ -872,22 +907,29 @@ class TrainerImpl:
                 scheduler.step()
 
             self.history.log_train(epoch, train_loss, train_acc, val_loss, val_acc)
-            self._log_epoch('train', epoch, train_loss, train_acc, val_loss, val_acc)
+            if self.config.verbose:
+                self._log_epoch('train', epoch, train_loss, train_acc, val_loss, val_acc)
 
             # Checkpoint on improvement
             if self._is_improved(val_loss, val_acc):
                 path = os.path.join(self.config.checkpoint_dir, f"{self.config.run_id}_train_best.pt")
                 self._save_checkpoint(path)
-                self._train_best_path = path      # latest best-epoch train path
+                self._train_best_path = path
+                self._best_epoch = epoch
                 self.state.early_stop_counter   = 0
             else:
                 self.state.early_stop_counter += 1
 
             if self._early_stopping_check():
-                print(f"  Early stopping at epoch {epoch}")
+                if self.config.verbose:
+                    print(f"  Early stopping at epoch {epoch}")
                 break
 
-        print(f"  Train complete. Best val_loss: {self.state.best_val_loss:.4f}")
+        elapsed = (time.time() - self._phase_start_time) / 60
+        print(f"  Train  — ran {epochs_run}/{self.config.epochs_train} epochs  "
+              f"best @ epoch {self._best_epoch}  "
+              f"val_loss={self.state.best_val_loss:.2f}  val_acc={self.state.best_val_acc:.2f}  "
+              f"time={elapsed:.1f}min")
 
     # ------------------------------------------------------------------
     # PyTorch — single epoch loops
@@ -908,7 +950,9 @@ class TrainerImpl:
 
         ctx = torch.enable_grad() if is_train else torch.no_grad()
         with ctx:
-            pbar = tqdm(loader, leave=False, desc=f"  {'train' if is_train else 'val  '}")
+            pbar = tqdm(loader, leave=False,
+                        desc=f"  {'train' if is_train else 'val  '}",
+                        disable=not self.config.verbose)
             for imgs, labels in pbar:
                 imgs   = imgs.to(self.device)
                 labels = labels.to(self.device)
@@ -954,7 +998,9 @@ class TrainerImpl:
 
         ctx = torch.enable_grad() if is_train else torch.no_grad()
         with ctx:
-            pbar = tqdm(loader, leave=False, desc=f"  {'train' if is_train else 'val  '}")
+            pbar = tqdm(loader, leave=False,
+                        desc=f"  {'train' if is_train else 'val  '}",
+                        disable=not self.config.verbose)
             for batch in pbar:
                 support = batch['support'].to(self.device)  # [N, K, C, H, W]
                 query   = batch['query'].to(self.device)    # [N, Q, C, H, W]
@@ -1031,7 +1077,10 @@ class TrainerImpl:
             )
 
         self._pretrain_best_path = mf_path
-        print(f"  [Lightning] _pretrain_best_path = '{mf_path}'")
+        self._pretrain_best_path = mf_path
+        print(f"  Pretrain — lightning  best val_loss={self.state.best_val_loss:.2f}  "
+              f"val_acc={self.state.best_val_acc:.2f}")
+        #print(f"  [Lightning] _pretrain_best_path = '{mf_path}'")
 
 
     def _run_train_lightning(self):
@@ -1143,7 +1192,6 @@ class TrainerImpl:
         if mode == 'none':
             os.remove(path)
             self.state.pretrain_export_path = ''
-            print(f"  Pretrain working ckpt deleted (pretrain_save_mode='none').")
 
         elif mode == 'full':
             # File already contains full model — it IS the export, keep as-is
@@ -1195,7 +1243,6 @@ class TrainerImpl:
         else:
             os.remove(path)
             self.state.final_export_path = ''
-            print(f"  Train working ckpt deleted (keep_final=False).")
 
     # ------------------------------------------------------------------
     # Logging

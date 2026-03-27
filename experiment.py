@@ -510,13 +510,11 @@ class ExperimentRunner:
         # Create evaluator
         evaluator = Evaluator(self.factory, run_cfg.eval_config, self.device)
 
-        print(f"\n  Phase 1: Pretrain")
         trainer.pretrain()
         # pretrain() loads best-epoch weights and handles export internally.
         # state.pretrain_export_path is set (path or '' depending on pretrain_save_mode).
         pre_softmax, pre_proto = evaluator.eval_pretrain(model)
 
-        print(f"\n  Phase 2: Train [{run_cfg.paradigm}]")
         trainer.train()
         # train() loads best-epoch weights and handles export internally.
         # state.final_export_path is set (path or '' depending on keep_final).
@@ -569,9 +567,18 @@ class ExperimentRunner:
             random_seed      = run_cfg.random_seed,
         )
 
-        print(f"\n  {run_cfg.run_id} done ({(end_time-start_time)/60:.1f} min)")
+        # ── Print summary ────────────────────────────────────────────
+        # Model memory snapshot
+        mem_mb = torch.cuda.memory_allocated(self.device)/1024/1024 if self.device.type == 'cuda' else 0)
+        total_p  = sum(p.numel() for p in model.parameters())
+        elapsed  = (end_time - start_time) / 60
+        print(f"\n  {run_cfg.run_id} DONE | "
+              f"params={total_p/1e6:.2f}M | "
+              f"mem={mem_mb:.1f}MB | "
+              f"time={elapsed:.1f}min")
+        print(f"  {'─'*60}")
         return result
-
+    
     # ------------------------------------------------------------------
     # ExperimentSummary
     # ------------------------------------------------------------------

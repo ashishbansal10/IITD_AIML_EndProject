@@ -201,14 +201,14 @@ class EvalResult:
     def __str__(self):
         if self.mechanism == 'softmax':
             return (f"[{self.phase:8s}] softmax   {self.pool:5s} | "
-                    f"top1: {self.top1_acc:.4f}  "
-                    f"top5: {self.top5_acc:.4f}  "
+                    f"top1: {self.top1_acc:.2f}  "
+                    f"top5: {self.top5_acc:.2f}  "
                     f"n={self.n_samples}")
         else:
             return (f"[{self.phase:8s}] prototypical {self.pool:5s} | "
-                    f"acc: {self.top1_acc:.4f}  "
-                    f"CI: [{self.ci_lower:.4f}, {self.ci_upper:.4f}]  "
-                    f"std: {self.std_acc:.4f}  "
+                    f"acc: {self.top1_acc:.2f}  "
+                    f"CI: [{self.ci_lower:.2f}, {self.ci_upper:.2f}]  "
+                    f"std: {self.std_acc:.2f}  "
                     f"n={self.n_samples}")
 
 
