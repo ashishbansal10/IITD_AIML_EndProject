@@ -1541,7 +1541,7 @@ class ModelConfig:
         Architecture: GNNBackbone → Linear → Softmax / Prototypical
         PLACEHOLDER — full implementation Phase 6.
 
-        hp_overrides: n_layers, dropout_rate, k_neighbours, n_heads, head_dropout, n_way, k_shot
+        hp_overrides: n_layers, backbone_dropout, k_neighbours, n_heads, head_dropout, n_way, k_shot
         """
         return cls.from_dict({
             'components': {
@@ -1549,7 +1549,7 @@ class ModelConfig:
                     'name': 'gnn_backbone', 'role': 'backbone',
                     'embed_dim':    embed_dim,
                     'n_layers':     hp_overrides.pop('n_layers',     3),
-                    'dropout_rate': hp_overrides.pop('dropout_rate', 0.1),
+                    'dropout_rate': hp_overrides.pop('backbone_dropout', 0.1),
                     'k_neighbours': hp_overrides.pop('k_neighbours', 5),
                     'n_heads':      hp_overrides.pop('n_heads',      4),
                 },
@@ -1899,17 +1899,34 @@ class CompositeModel(nn.Module):
         trainable_params = 0
         for alias, comp in self._components.items():
             role     = self._roles.get(alias, '?')
-            frozen   = '❄ frozen'   if comp.is_frozen()           else '✓ trainable'
-            math     = ' [math]'     if comp.is_mathematical       else ''
-            chain    = ' (SubChain)' if isinstance(comp, SubChain) else ''
+            frozen   = '❄ frozen'   if comp.is_frozen()     else '✓ trainable'
+            math     = ' [math]'    if comp.is_mathematical  else ''
             p_count  = comp.param_count()
             t_count  = comp.trainable_param_count()
             total_params     += p_count
             trainable_params += t_count
-            lines.append(
-                f"  {alias:15s} [{role:8s}] {frozen:12s} "
-                f"params: {p_count:>8,}  trainable: {t_count:>8,}{math}{chain}"
-            )
+
+            if isinstance(comp, SubChain):
+                # Top-level SubChain row
+                lines.append(
+                    f"  {'SubChain':15s} [{role:8s}] {frozen:12s} "
+                    f"params: {p_count:>8,}  trainable: {t_count:>8,}{math}"
+                )
+                # Each member indented 2 extra spaces
+                for member in comp.components:
+                    mname = member._hp.get('name', type(member).__name__)
+                    mfroz = '❄ frozen' if member.is_frozen() else '✓ trainable'
+                    lines.append(
+                        f"    {mname:13s} [{role:8s}] {mfroz:12s} "
+                        f"params: {member.param_count():>8,}  trainable: {member.trainable_param_count():>8,}{math}"
+                    )
+            else:
+                name = comp._hp.get('name', type(comp).__name__)
+                lines.append(
+                    f"  {name:15s} [{role:8s}] {frozen:12s} "
+                    f"params: {p_count:>8,}  trainable: {t_count:>8,}{math}"
+                )
+
         lines.append(f"  {'─'*78}")
         lines.append(
             f"  {'Total':15s} {'':9s} {'':12s} "
@@ -1918,8 +1935,7 @@ class CompositeModel(nn.Module):
         return "\n".join(lines)
 
     def __str__(self):  return self.summary()
-    def __repr__(self): return (f"CompositeModel(components={self.component_names()}, "
-                                f"device={self._device})")
+    def __repr__(self): return (f"CompositeModel(components={self.component_names()}, device={self._device})")
 
 
 # ==============================================================================

@@ -200,16 +200,16 @@ class EvalResult:
 
     def __str__(self):
         if self.mechanism == 'softmax':
-            return (f"[{self.phase:8s}] softmax   {self.pool:5s} | "
-                    f"top1: {self.top1_acc:.2f}  "
-                    f"top5: {self.top5_acc:.2f}  "
+            return (f"    softmax      [{self.phase:8s}] {self.pool:5s} | "
+                    f"top1: {self.top1_acc:.2f}  top5: {self.top5_acc:.2f}  "
                     f"n={self.n_samples}")
         else:
-            return (f"[{self.phase:8s}] prototypical {self.pool:5s} | "
+            primary = '  \u2605 primary' if self.pool == 'novel' else ''
+            return (f"    prototypical [{self.phase:8s}] {self.pool:5s} | "
                     f"acc: {self.top1_acc:.2f}  "
                     f"CI: [{self.ci_lower:.2f}, {self.ci_upper:.2f}]  "
                     f"std: {self.std_acc:.2f}  "
-                    f"n={self.n_samples}")
+                    f"n={self.n_samples}{primary}")
 
 
 # ==============================================================================
@@ -258,15 +258,18 @@ class RunScores:
         }
 
     def summary(self) -> str:
-        lines = [f"\nRun: {self.run_id} | {self.arch} | {self.paradigm}",
-                 f"{'─'*65}"]
-        for score in [self.pretrain_softmax,    self.pretrain_proto,
-                      self.trained_softmax,      self.trained_proto_seen,
-                      self.trained_proto_novel]:
-            lines.append(f"  {score}")
-        lines.append(f"{'─'*65}")
+        lines = [
+            f"",
+            f"  Eval Summary Acc.: {self.run_id}  [{self.arch} | {self.paradigm}]",
+            f"    Pretrain — softmax: {self.pretrain_softmax.top1_acc:.2f}  "
+            f"proto_seen: {self.pretrain_proto.top1_acc:.2f}",
+            f"    Trained  — softmax: {self.trained_softmax.top1_acc:.2f}  "
+            f"proto_seen: {self.trained_proto_seen.top1_acc:.2f}  "
+            f"proto_novel: {self.trained_proto_novel.top1_acc:.2f} \u2605  "
+            f"CI:[{self.trained_proto_novel.ci_lower:.2f}, {self.trained_proto_novel.ci_upper:.2f}]",
+            f"",
+        ]
         return '\n'.join(lines)
-
 
 # ==============================================================================
 # Evaluator
@@ -343,7 +346,7 @@ class Evaluator:
         print(f"\n  Evaluating pretrain checkpoint...")
         softmax = self._score_softmax(model, pool='test', phase='pretrain')
         proto   = self._score_prototypical(model, pool='test', phase='pretrain', n_episodes=self.config.n_episodes_seen)
-        print(f"    {softmax}")
+        print(f"\n    {softmax}")
         print(f"    {proto}")
         return softmax, proto
 
@@ -357,7 +360,7 @@ class Evaluator:
         softmax     = self._score_softmax(model, pool='test',  phase='trained')
         proto_seen  = self._score_prototypical(model, pool='test',  phase='trained', n_episodes=self.config.n_episodes_seen)
         proto_novel = self._score_prototypical(model, pool='novel', phase='trained', n_episodes=self.config.n_episodes_novel)
-        print(f"    {softmax}")
+        print(f"\n    {softmax}")
         print(f"    {proto_seen}")
         print(f"    {proto_novel}")
         return softmax, proto_seen, proto_novel

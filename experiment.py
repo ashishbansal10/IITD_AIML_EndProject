@@ -428,13 +428,20 @@ class ExperimentRunner:
         print(f"{'='*70}")
 
         for i, run_cfg in enumerate(self.run_configs):
-            print(f"\n[{i+1}/{len(self.run_configs)}] {run_cfg.run_id}")
+            print(f"\n[{i+1}/{len(self.run_configs)}] {run_cfg.run_id}  [arch: {run_cfg.arch} | paradigm: {run_cfg.paradigm} ]")
             result = self._run_single(run_cfg)
             self.run_results[run_cfg.run_id] = result
 
             path = os.path.join(self.exec_config.results_dir, f"{run_cfg.run_id}_result.json")
             result.to_json(path)
             print(f"  Saved: {path}")
+
+            elapsed = result.duration_seconds / 60
+            mem_mb  = (torch.cuda.memory_allocated(self.device) / 1024 / 1024
+                       if self.device.type == 'cuda' else 0)
+            print(f"\n  {run_cfg.run_id} DONE | mem={mem_mb:.1f}MB | time={elapsed:.1f}min")
+            print(f"  {'─'*60}")
+
 
         exp_end     = time.time()
         exp_end_str = datetime.datetime.now().isoformat()
@@ -567,17 +574,6 @@ class ExperimentRunner:
             random_seed      = run_cfg.random_seed,
         )
 
-        # ── Print summary ────────────────────────────────────────────
-        # Model memory snapshot
-        mem_mb  = (torch.cuda.memory_allocated(self.device) / 1024 / 1024
-                   if self.device.type == 'cuda' else 0)
-        total_p  = sum(p.numel() for p in model.parameters())
-        elapsed  = (end_time - start_time) / 60
-        print(f"\n  {run_cfg.run_id} DONE | "
-              f"params={total_p/1e6:.2f}M | "
-              f"mem={mem_mb:.1f}MB | "
-              f"time={elapsed:.1f}min")
-        print(f"  {'─'*60}")
         return result
     
     # ------------------------------------------------------------------
@@ -730,57 +726,93 @@ class Plotter:
         os.makedirs(plots_dir, exist_ok=True)
 
     def learning_curves(self, result: RunResult, show: bool = True):
-        """Train/val loss and accuracy curves for one run."""
+        """Train/val loss and accuracy curves for one run — combined phases."""
         try:
             import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
         except ImportError:
             raise ImportError("pip install matplotlib")
 
         h   = result.training_history
-        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-        fig.suptitle(f"Learning Curves — {result.run_id}", fontsize=14)
+        ts  = result.training_state
 
-        # Pretrain
-        if h.get('pretrain_epochs'):
-            ep = h['pretrain_epochs']
-            axes[0][0].plot(ep, h['pretrain_train_loss'], label='train')
-            axes[0][0].plot(ep, h['pretrain_val_loss'],   label='val')
-            axes[0][0].set_title('Pretrain Loss')
-            axes[0][0].set_xlabel('Epoch')
-            axes[0][0].legend()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        fig.suptitle(f"Learning Curves — {result.run_id}", fontsize=12)
 
-            axes[1][0].plot(ep, h['pretrain_train_acc'], label='train')
-            axes[1][0].plot(ep, h['pretrain_val_acc'],   label='val')
-            axes[1][0].set_title('Pretrain Accuracy')
-            axes[1][0].set_xlabel('Epoch')
-            axes[1][0].legend()
+        has_pretrain = bool(h.get('pretrain_epochs'))
+        has_train    = bool(h.get('train_epochs'))
 
-        # Train
-        if h.get('train_epochs'):
-            ep = h['train_epochs']
-            axes[0][1].plot(ep, h['train_loss'], label='train')
-            axes[0][1].plot(ep, h['val_loss'],   label='val')
-            axes[0][1].set_title(f"Train Loss [{result.paradigm}]")
-            axes[0][1].set_xlabel('Epoch')
-            axes[0][1].legend()
+        pretrain_len = len(h['pretrain_epochs']) if has_pretrain else 0
 
-            axes[1][1].plot(ep, h['train_acc'], label='train')
-            axes[1][1].plot(ep, h['val_acc'],   label='val')
-            axes[1][1].set_title(f"Train Accuracy [{result.paradigm}]")
-            axes[1][1].set_xlabel('Epoch')
-            axes[1][1].legend()
+        # Offset train epochs to continue from pretrain
+        train_ep_offset = [e + pretrain_len for e in h['train_epochs']] if has_train else []
 
-        plt.tight_layout()
+        blue   = '#378ADD'
+        orange = '#EF9F27'
+        red    = '#E24B4A'
+        gray   = '#B4B2A9'
+
+        for ax_idx, metric in enumerate(['loss', 'acc']):
+            ax = axes[ax_idx]
+
+            # ── Pretrain lines ────────────────────────────────────────
+            if has_pretrain:
+                ep = h['pretrain_epochs']
+                tr = h[f'pretrain_train_{metric}']
+                vl = h[f'pretrain_val_{metric}']
+                ax.plot(ep, tr, color=blue,   linewidth=1.5)
+                ax.plot(ep, vl, color=orange, linewidth=1.5)
+
+                # Best pretrain epoch marker
+                best_pretrain_ep = ts.get('pretrain_best_epoch', None)
+                if best_pretrain_ep is not None and best_pretrain_ep < len(vl):
+                    ax.plot(best_pretrain_ep, vl[best_pretrain_ep], 'o', color=red, markersize=6, zorder=5)
+
+            # ── Train lines (dashed, offset) ──────────────────────────
+            if has_train:
+                tr = h['train_loss'] if metric == 'loss' else h['train_acc']
+                vl = h['val_loss']   if metric == 'loss' else h['val_acc']
+                ax.plot(train_ep_offset, tr, color=blue,   linewidth=1.5, linestyle='--')
+                ax.plot(train_ep_offset, vl, color=orange, linewidth=1.5, linestyle='--')
+
+                # Best train epoch marker
+                best_train_ep = ts.get('best_epoch', None)
+                if best_train_ep is not None and best_train_ep < len(vl):
+                    ax.plot(train_ep_offset[best_train_ep], vl[best_train_ep], 'o', color=red, markersize=6, zorder=5)
+
+            # ── Phase separator ───────────────────────────────────────
+            if has_pretrain and has_train:
+                ax.axvline(x=pretrain_len - 0.5, color=gray,
+                           linestyle=':', linewidth=0.8)
+                ylim = ax.get_ylim()
+                ax.text(pretrain_len - 1, ylim[1], 'pretrain', ha='right', va='top', fontsize=8, color=gray)
+                ax.text(pretrain_len,     ylim[1], 'train', ha='left',  va='top', fontsize=8, color=gray)
+
+            ax.set_title('Loss' if metric == 'loss' else 'Accuracy', fontsize=11)
+            ax.set_xlabel('Epoch', fontsize=9)
+            ax.tick_params(labelsize=8)
+            ax.grid(True, alpha=0.15)
+
+        # ── Shared legend ─────────────────────────────────────────────
+        legend_elements = [
+            mpatches.Patch(color=blue,   label='train'),
+            mpatches.Patch(color=orange, label='val'),
+            plt.Line2D([0],[0], color='gray', linestyle='--', label='train phase'),
+            plt.Line2D([0],[0], color=red, marker='o', linestyle='None', markersize=6, label='best epoch'),
+        ]
+        fig.legend(handles=legend_elements, loc='lower center', ncol=4, fontsize=9, frameon=False, 
+                   bbox_to_anchor=(0.5, -0.02))
+
+        plt.tight_layout(rect=[0, 0.06, 1, 1])
         path = os.path.join(self.plots_dir, f"{result.run_id}_curves.png")
-        plt.savefig(path, dpi=150)
+        plt.savefig(path, dpi=150, bbox_inches='tight')
         print(f"Saved: {path}")
         if show: plt.show()
         plt.close()
 
     def score_comparison(self, summary: ExperimentSummary, show: bool = True):
         """
-        Bar chart: 5 scores × 6 runs.
-        Primary metric trained_proto_novel highlighted.
+        Bar chart: 3 trained scores × 6 runs grouped by arch → paradigm.
         """
         try:
             import matplotlib.pyplot as plt
@@ -788,36 +820,96 @@ class Plotter:
         except ImportError:
             raise ImportError("pip install matplotlib")
 
-        ct       = summary.comparison_table
-        scores   = list(ct.keys())
-        run_ids  = sorted(next(iter(ct.values())).keys())
-        x        = np.arange(len(scores))
-        width    = 0.8 / max(len(run_ids), 1)
+        # ── Data ─────────────────────────────────────────────────────
+        ct = summary.comparison_table
+        metrics = ['trained_softmax', 'trained_proto_seen', 'trained_proto_novel']
+        metric_labels = ['Softmax', 'Proto Seen', 'Proto Novel ★']
 
-        fig, ax = plt.subplots(figsize=(16, 6))
-        for i, run_id in enumerate(run_ids):
-            values = [ct[s].get(run_id) or 0 for s in scores]
-            ax.bar(x + i * width, values, width, label=run_id, alpha=0.8)
+        # Fixed order: arch → paradigm
+        run_order = [
+            'run1_cnn_standard', 'run2_cnn_fewshot',
+            'run3_gnn_standard', 'run4_gnn_fewshot',
+            'run5_hybrid_standard', 'run6_hybrid_fewshot',
+        ]
+        # Only keep runs that exist in results
+        run_order = [r for r in run_order if r in next(iter(ct.values()))]
 
-        ax.set_xlabel('Score')
-        ax.set_ylabel('Accuracy (top-1)')
-        ax.set_title('Score Comparison Across All Runs')
-        ax.set_xticks(x + width * (len(run_ids) - 1) / 2)
-        ax.set_xticklabels(scores, rotation=30, ha='right')
-        ax.legend(fontsize=8)
-        ax.set_ylim(0, 1.05)
+        arch_labels  = ['CNN', 'GNN', 'Hybrid']
+        colors       = {
+            'trained_softmax'     : ('#7F77DD', '#AFA9EC'),  # (std, few)
+            'trained_proto_seen'  : ('#EF9F27', '#FAC775'),
+            'trained_proto_novel' : ('#E24B4A', '#F09595'),
+        }
 
-        # Highlight primary metric
-        primary_idx = scores.index('trained_proto_novel') \
-                      if 'trained_proto_novel' in scores else -1
-        if primary_idx >= 0:
-            ax.axvspan(primary_idx - 0.4, primary_idx + len(run_ids) * width + 0.1,
-                       alpha=0.08, color='gold', label='primary metric')
+        n_metrics  = len(metrics)
+        n_archs    = 3
+        arch_width = 0.7          # total width per arch group
+        bar_width  = arch_width / (n_metrics * 2 + (n_metrics - 1) * 0.3)
+        metric_gap = bar_width * 0.3
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        for ai in range(n_archs):
+            arch_center = ai * 1.0
+            std_run = run_order[ai * 2]
+            few_run = run_order[ai * 2 + 1]
+
+            # start x for first bar in this arch group
+            total_w = n_metrics * 2 * bar_width + (n_metrics - 1) * metric_gap
+            x_start = arch_center - total_w / 2
+
+            for mi, (metric, mlabel) in enumerate(zip(metrics, metric_labels)):
+                x_metric = x_start + mi * (2 * bar_width + metric_gap)
+                std_val  = ct[metric].get(std_run, 0) or 0
+                few_val  = ct[metric].get(few_run, 0) or 0
+                c_std, c_few = colors[metric]
+
+                ax.bar(x_metric,              std_val, bar_width,
+                       color=c_std, label=f'{mlabel} std' if ai == 0 else '')
+                ax.bar(x_metric + bar_width,  few_val, bar_width,
+                       color=c_few, label=f'{mlabel} few' if ai == 0 else '')
+
+                # metric label below bars
+                if ai == 0:
+                    ax.text(x_metric + bar_width, -0.06, mlabel,
+                            ha='center', va='top', fontsize=7.5,
+                            color='#888780', transform=ax.transData)
+
+        # ── Arch labels + separators ──────────────────────────────────
+        for ai, arch in enumerate(arch_labels):
+            ax.text(ai * 1.0, 1.02, arch, ha='center', va='bottom',
+                    fontsize=11, fontweight='bold', color='#444441')
+            if ai > 0:
+                ax.axvline(ai - 0.5, color='#B4B2A9', linewidth=0.8,
+                           linestyle='--', alpha=0.5)
+
+        # ── Std / Few legend markers ──────────────────────────────────
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#7F77DD', label='Standard — softmax'),
+            Patch(facecolor='#AFA9EC', label='FewShot  — softmax'),
+            Patch(facecolor='#EF9F27', label='Standard — proto seen'),
+            Patch(facecolor='#FAC775', label='FewShot  — proto seen'),
+            Patch(facecolor='#E24B4A', label='Standard — proto novel ★'),
+            Patch(facecolor='#F09595', label='FewShot  — proto novel ★'),
+        ]
+        ax.legend(handles=legend_elements, fontsize=8, ncol=3,
+                  loc='upper center', bbox_to_anchor=(0.5, -0.12),
+                  frameon=False)
+
+        ax.set_xlim(-0.55, 2.55)
+        ax.set_ylim(0, 1.08)
+        ax.set_xticks([])
+        ax.set_ylabel('Accuracy (top-1)', fontsize=10)
+        ax.set_title('Trained Model Results — Grouped by Architecture',
+                     fontsize=12, pad=14)
+        ax.yaxis.grid(True, alpha=0.15)
+        ax.set_axisbelow(True)
 
         plt.tight_layout()
         path = os.path.join(self.plots_dir,
                             f"score_comparison_{summary.experiment_id}.png")
-        plt.savefig(path, dpi=150)
+        plt.savefig(path, dpi=150, bbox_inches='tight')
         print(f"Saved: {path}")
         if show: plt.show()
         plt.close()
@@ -849,7 +941,7 @@ class Plotter:
         print(f"{'='*len(header)}")
         print(f"← primary metric: novel class generalization\n")
 
-    def print_results_table(runner, save_path='results/results_table.html'):
+    def print_results_table(self, runner, save_path='results/results_table.html'):
         """
         Prints a styled HTML results table for all 6 runs.
         Suitable for copy-paste into MS Word / project report.
