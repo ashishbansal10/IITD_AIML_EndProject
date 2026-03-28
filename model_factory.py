@@ -1909,7 +1909,7 @@ class CompositeModel(nn.Module):
             if isinstance(comp, SubChain):
                 # Top-level SubChain row
                 lines.append(
-                    f"  {'SubChain':15s} [{role:8s}] {frozen:12s} "
+                    f"  {'SubChain':20s} [{role:8s}] {frozen:12s} "
                     f"params: {p_count:>8,}  trainable: {t_count:>8,}{math}"
                 )
                 # Each member indented 2 extra spaces
@@ -1917,19 +1917,19 @@ class CompositeModel(nn.Module):
                     mname = member._hp.get('name', type(member).__name__)
                     mfroz = '❄ frozen' if member.is_frozen() else '✓ trainable'
                     lines.append(
-                        f"    {mname:13s} [{role:8s}] {mfroz:12s} "
+                        f"    {mname:18s} [{role:8s}] {mfroz:12s} "
                         f"params: {member.param_count():>8,}  trainable: {member.trainable_param_count():>8,}{math}"
                     )
             else:
                 name = comp._hp.get('name', type(comp).__name__)
                 lines.append(
-                    f"  {name:15s} [{role:8s}] {frozen:12s} "
+                    f"  {name:20s} [{role:8s}] {frozen:12s} "
                     f"params: {p_count:>8,}  trainable: {t_count:>8,}{math}"
                 )
 
         lines.append(f"  {'─'*78}")
         lines.append(
-            f"  {'Total':15s} {'':9s} {'':12s} "
+            f"  {'Total':20s} {'':9s} {'':12s} "
             f"params: {total_params:>8,}  trainable: {trainable_params:>8,}"
         )
         return "\n".join(lines)
