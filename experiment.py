@@ -1081,8 +1081,8 @@ class Plotter:
         # ── Build styler ──────────────────────────────────────────────────
         fmt = {
             'Pre Softmax %'     : '{:.2f}',
-            'Pre Proto Seen %'  : '{:.2f},
-            'Pre Proto Novel %' : '{:.2f},
+            'Pre Proto Seen %'  : '{:.2f}',
+            'Pre Proto Novel %' : '{:.2f}',
             'Tr Softmax %'      : '{:.2f}',
             'Tr Proto Seen %'   : '{:.2f}',
             'Tr Proto Novel %'  : '{:.2f}',
