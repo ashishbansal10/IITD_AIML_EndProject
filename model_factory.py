@@ -1913,7 +1913,7 @@ class CompositeModel(nn.Module):
                     f"params: {p_count:>8,}  trainable: {t_count:>8,}{math}"
                 )
                 # Each member indented 2 extra spaces
-                for member in comp.components:
+                for member in comp._chain:
                     mname = member._hp.get('name', type(member).__name__)
                     mfroz = '❄ frozen' if member.is_frozen() else '✓ trainable'
                     lines.append(
