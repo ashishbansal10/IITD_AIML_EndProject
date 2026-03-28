@@ -158,9 +158,19 @@ Notes — Design Decisions & Status
 
 [FUTURE] Replace _execute_graph() with torch.fx GraphModule.
 
-[FUTURE] PrototypicalNet distance_metric='cosine' — stub present, not implemented.
-
 [FUTURE] detach()/attach() — component hot-swap for novel class fine-tuning.
+
+[FUTURE] Replace GNNBackbone fixed grid graph with superpixel-based 
+         graph construction (SLIC) or dynamic k-NN graph per forward pass.
+         Current fixed grid topology does not reflect actual visual 
+         relationships in the image — superpixel graph would provide 
+         semantically meaningful node connectivity.
+         
+[FUTURE] Vision GNN (ViG, Han et al. 2022) as alternative to current 
+         GNNBackbone — treats image patches as graph nodes with dynamic 
+         k-NN graph per layer. Requires large-scale pretraining — 
+         not feasible within Mini-ImageNet scope but relevant for 
+         future work with larger datasets.
 """
 
 import os
@@ -847,6 +857,14 @@ class PrototypicalNet(ComponentModel):
         CompositeModel has zero knowledge of N/K/Q.
         Trainer computes embeddings via mode='embedding', passes to mode='prototypical'.
 
+    L2 Normalisation:
+        Embeddings are L2-normalised to unit hypersphere before distance
+        computation. This ensures distances reflect angular separation
+        (directional similarity) rather than magnitude differences.
+        Euclidean distance on unit hypersphere = 2 - 2·cos(q, p) —
+        monotonic function of cosine similarity.
+        Consistent improvement documented in Laenen et al. (2021).
+        
     Algorithm:
         1. prototype[c] = mean(support_emb for class c)   [N, D]
         2. distance[q,c] = euclidean(query_emb[q], prototype[c])
@@ -865,7 +883,7 @@ class PrototypicalNet(ComponentModel):
     HP (protocol config — not Optuna tunable):
         n_way           (int, 5)           : classes per episode
         k_shot          (int, 5)           : support samples per class
-        distance_metric (str, 'euclidean') : 'euclidean' (cosine: [FUTURE])
+        distance_metric (str, 'euclidean') : 'euclidean'
 
     Input:
         support_emb : [N*K, D]  — pre-computed via mode='embedding'
@@ -880,10 +898,8 @@ class PrototypicalNet(ComponentModel):
         'distance_metric': 'euclidean',
     }
 
-    def __init__(self, n_way: int = 5, k_shot: int = 5,
-                 distance_metric: str = 'euclidean', **kwargs):
-        super().__init__(n_way=n_way, k_shot=k_shot,
-                         distance_metric=distance_metric, **kwargs)
+    def __init__(self, n_way: int = 5, k_shot: int = 5, distance_metric: str = 'euclidean', **kwargs):
+        super().__init__(n_way=n_way, k_shot=k_shot, distance_metric=distance_metric, **kwargs)
         self.n_way           = n_way
         self.k_shot          = k_shot
         self.distance_metric = distance_metric
@@ -908,6 +924,15 @@ class PrototypicalNet(ComponentModel):
         Returns:
             logits      : [N*Q, N_way] — negative Euclidean distances
         """
+
+        # ── L2 normalise embeddings to unit hypersphere ───────────────
+        # Prevents magnitude differences from dominating distance computation.
+        # All embeddings projected to unit sphere — distances reflect
+        # angular separation only. Laenen et al. (2021) show this is one
+        # of the most impactful simple improvements for prototypical networks.
+        support_emb = F.normalize(support_emb, p=2, dim=-1)   # [N*K, D]
+        query_emb   = F.normalize(query_emb,   p=2, dim=-1)   # [N*Q, D]
+
         D  = support_emb.shape[-1]
 
         # [N*K, D] → [N, K, D] → mean → [N, D]
@@ -919,15 +944,11 @@ class PrototypicalNet(ComponentModel):
             dists = torch.cdist(query_emb, prototypes, p=2)
             return -dists   # [N*Q, N]
 
-        elif self.distance_metric == 'cosine':
-            # [FUTURE] cosine similarity
-            raise NotImplementedError(
-                "distance_metric='cosine' not yet implemented. Use 'euclidean'."
-            )
         else:
             raise ValueError(
                 f"Unknown distance_metric: '{self.distance_metric}'. "
-                f"Use 'euclidean' or 'cosine'."
+                f"Only 'euclidean' supported — after L2 normalisation "
+                f"Euclidean distance is equivalent to cosine distance."
             )
 
 
@@ -1097,7 +1118,7 @@ class GNNBackbone(ComponentModel):
  
     GNN layers:
         Linear projection: 256 → embed_dim (640)
-        N × GCNConv(embed_dim, embed_dim) + ReLU + Dropout
+        N x GCNConv(embed_dim, embed_dim) + ReLU + Dropout
  
     Global pooling:
         Mean over all 100 nodes per image → [B, embed_dim]

@@ -15,13 +15,16 @@ Per-Run Score Collection
 Each run produces 5 scores independently:
 
     pretrain_softmax    — softmax accuracy on test seen, pretrain checkpoint
-                          top1 + top5, no CI (full deterministic batch pass)
+                          top1, no CI (full deterministic batch pass)
 
-    pretrain_proto      — prototypical accuracy on test seen, pretrain checkpoint
+    pretrain_proto_seen — prototypical accuracy on test seen, pretrain checkpoint
                           mean + CI + std over n_episodes_seen episodes
+    
+    pretrain_proto_novel — prototypical accuracy on novel classes, pretrain checkpoint
+                          mean + CI + std over n_episodes_novel episodes
 
     trained_softmax     — softmax accuracy on test seen, trained checkpoint
-                          top1 + top5, no CI
+                          top1, no CI
 
     trained_proto_seen  — prototypical accuracy on test seen, trained checkpoint
                           mean + CI + std over n_episodes_seen episodes
@@ -30,7 +33,7 @@ Each run produces 5 scores independently:
                           mean + CI + std over n_episodes_novel episodes
                           ← PRIMARY metric for few-shot generalization
 
-6 runs × 5 scores = 30 scores total.
+6 runs x 6 scores = 36 scores total.
 Comparison across runs done in Plotter / ResultStore.
 
 Softmax vs prototypical
@@ -39,7 +42,6 @@ Softmax (full batch):
     model.eval()
     probs  = model(imgs, mode='softmax')     # direct probabilities
     top1   = argmax(probs) == labels
-    top5   = labels in top-5 predictions
     Single deterministic pass — no CI needed.
     NEVER compute loss here — evaluation only.
 
@@ -164,13 +166,11 @@ class EvalResult:
 
     Softmax scores:
         top1_acc  — top-1 accuracy over full test set  (primary)
-        top5_acc  — top-5 accuracy over full test set
         ci_lower, ci_upper, std_acc → None (not applicable)
         n_samples → total images evaluated
 
     prototypical scores:
         top1_acc  — mean accuracy over episodes  (primary)
-        top5_acc  → None (not applicable for N-way classification)
         ci_lower  — 95% CI lower bound
         ci_upper  — 95% CI upper bound
         std_acc   — std deviation across episodes
@@ -183,9 +183,6 @@ class EvalResult:
 
     # Primary metric — always present
     top1_acc:   float
-
-    # Softmax only
-    top5_acc:   Optional[float] = None
 
     # prototypical only
     ci_lower:   Optional[float] = None
@@ -201,7 +198,7 @@ class EvalResult:
     def __str__(self):
         if self.mechanism == 'softmax':
             return (f"    softmax      [{self.phase:8s}] {self.pool:5s} | "
-                    f"top1: {self.top1_acc:.2f}  top5: {self.top5_acc:.2f}  "
+                    f"top1: {self.top1_acc:.2f}  "
                     f"n={self.n_samples}")
         else:
             primary = '  \u2605 primary' if self.pool == 'novel' else ''
@@ -238,7 +235,8 @@ class RunScores:
 
     # Pretrain checkpoint scores
     pretrain_softmax:     EvalResult   # softmax,  test seen,  pretrain
-    pretrain_proto:       EvalResult   # prototypical, test seen, pretrain
+    pretrain_proto_seen:  EvalResult   # prototypical, test seen, pretrain
+    pretrain_proto_novel: EvalResult   # prototypical, novel, pretrain
 
     # Trained checkpoint scores
     trained_softmax:      EvalResult   # softmax,   test seen,  trained
@@ -247,14 +245,15 @@ class RunScores:
 
     def to_dict(self) -> dict:
         return {
-            'run_id':              self.run_id,
-            'paradigm':            self.paradigm,
-            'arch':                self.arch,
-            'pretrain_softmax':    self.pretrain_softmax.to_dict(),
-            'pretrain_proto':      self.pretrain_proto.to_dict(),
-            'trained_softmax':     self.trained_softmax.to_dict(),
-            'trained_proto_seen':  self.trained_proto_seen.to_dict(),
-            'trained_proto_novel': self.trained_proto_novel.to_dict(),
+            'run_id':               self.run_id,
+            'paradigm':             self.paradigm,
+            'arch':                 self.arch,
+            'pretrain_softmax':     self.pretrain_softmax.to_dict(),
+            'pretrain_proto_seen':  self.pretrain_proto_seen.to_dict(),
+            'pretrain_proto_novel': self.pretrain_proto_novel.to_dict(),
+            'trained_softmax':      self.trained_softmax.to_dict(),
+            'trained_proto_seen':   self.trained_proto_seen.to_dict(),
+            'trained_proto_novel':  self.trained_proto_novel.to_dict(),
         }
 
     def summary(self) -> str:
@@ -262,7 +261,8 @@ class RunScores:
             f"",
             f"  Eval Summary Acc.: {self.run_id}  [{self.arch} | {self.paradigm}]",
             f"    Pretrain — softmax: {self.pretrain_softmax.top1_acc:.2f}  "
-            f"proto_seen: {self.pretrain_proto.top1_acc:.2f}",
+            f"proto_seen: {self.pretrain_proto_seen.top1_acc:.2f}",
+            f"proto_novel: {self.pretrain_proto_novel.top1_acc:.2f}",
             f"    Trained  — softmax: {self.trained_softmax.top1_acc:.2f}  "
             f"proto_seen: {self.trained_proto_seen.top1_acc:.2f}  "
             f"proto_novel: {self.trained_proto_novel.top1_acc:.2f} \u2605  "
@@ -282,7 +282,7 @@ class Evaluator:
     Usage — called from ExperimentRunner immediately after each phase:
 
         # After pretrain — 2 scores
-        pre_softmax, pre_proto = evaluator.eval_pretrain(model)
+        pre_softmax, pre_proto_seen, pre_proto_novel = evaluator.eval_pretrain(model)
 
         # After full training — 3 scores
         tr_softmax, tr_proto_seen, tr_proto_novel = evaluator.eval_trained(model)
@@ -290,7 +290,7 @@ class Evaluator:
         # Pack into RunScores
         run_scores = evaluator.collect(
             run_id, paradigm, arch,
-            pre_softmax, pre_proto,
+            pre_softmax, pre_proto_seen, pre_proto_novel,
             tr_softmax, tr_proto_seen, tr_proto_novel
         )
     """
@@ -340,15 +340,17 @@ class Evaluator:
     def eval_pretrain(self, model) -> Tuple[EvalResult, EvalResult]:
         """
         Evaluates at pretrain checkpoint.
-        Returns (pretrain_softmax, pretrain_proto).
+        Returns (pretrain_softmax, pretrain_proto_seen, pretrain_proto_novel).
         Called immediately after pretrain() + load_best().
         """
         print(f"\n  Evaluating pretrain checkpoint...")
         softmax = self._score_softmax(model, pool='test', phase='pretrain')
-        proto   = self._score_prototypical(model, pool='test', phase='pretrain', n_episodes=self.config.n_episodes_seen)
+        proto_seen   = self._score_prototypical(model, pool='test', phase='pretrain', n_episodes=self.config.n_episodes_seen)
+        proto_novel  = self._score_prototypical(model, pool='novel', phase='pretrain', n_episodes=self.config.n_episodes_novel)
         print(f"\n    {softmax}")
-        print(f"    {proto}")
-        return softmax, proto
+        print(f"    {proto_seen}")
+        print(f"    {proto_novel}")
+        return softmax, proto_seen, proto_novel
 
     def eval_trained(self, model) -> Tuple[EvalResult, EvalResult, EvalResult]:
         """
@@ -366,21 +368,23 @@ class Evaluator:
         return softmax, proto_seen, proto_novel
 
     def collect(self,
-                run_id:              str,
-                paradigm:            str,
-                arch:                str,
-                pretrain_softmax:    EvalResult,
-                pretrain_proto:      EvalResult,
-                trained_softmax:     EvalResult,
-                trained_proto_seen:  EvalResult,
-                trained_proto_novel: EvalResult) -> RunScores:
+                run_id:               str,
+                paradigm:             str,
+                arch:                 str,
+                pretrain_softmax:     EvalResult,
+                pretrain_proto_seen:  EvalResult,
+                pretrain_proto_novel: EvalResult,
+                trained_softmax:      EvalResult,
+                trained_proto_seen:   EvalResult,
+                trained_proto_novel:  EvalResult) -> RunScores:
         """Packs all 5 EvalResults into RunScores."""
         run_scores = RunScores(
             run_id               = run_id,
             paradigm             = paradigm,
             arch                 = arch,
             pretrain_softmax     = pretrain_softmax,
-            pretrain_proto       = pretrain_proto,
+            pretrain_proto_seen  = pretrain_proto_seen,
+            pretrain_proto_novel = pretrain_proto_novel,
             trained_softmax      = trained_softmax,
             trained_proto_seen   = trained_proto_seen,
             trained_proto_novel  = trained_proto_novel,
@@ -400,7 +404,6 @@ class Evaluator:
         Full batch softmax evaluation.
         mode='softmax' → direct probabilities — no F.softmax() call needed.
         top1: argmax == label
-        top5: true label in top-5 predicted classes
         NEVER compute loss here — evaluation only.
         """
         loader = self.factory.get_loader(
@@ -412,7 +415,6 @@ class Evaluator:
 
         model.eval()
         total_top1    = 0
-        total_top5    = 0
         total_samples = 0
 
         with torch.no_grad():
@@ -424,9 +426,6 @@ class Evaluator:
                 preds  = probs.argmax(dim=1)
                 total_top1 += (preds == labels).sum().item()
 
-                k      = min(5, probs.size(1))
-                top5   = probs.topk(k, dim=1).indices      # [B, k]
-                total_top5 += (top5 == labels.unsqueeze(1)).any(dim=1).sum().item()
                 total_samples += labels.size(0)
 
         return EvalResult(
@@ -434,7 +433,6 @@ class Evaluator:
             pool      = pool,
             phase     = phase,
             top1_acc  = total_top1 / max(total_samples, 1),
-            top5_acc  = total_top5 / max(total_samples, 1),
             n_samples = total_samples
         )
 

@@ -520,7 +520,7 @@ class ExperimentRunner:
         trainer.pretrain()
         # pretrain() loads best-epoch weights and handles export internally.
         # state.pretrain_export_path is set (path or '' depending on pretrain_save_mode).
-        pre_softmax, pre_proto = evaluator.eval_pretrain(model)
+        pre_softmax, pre_proto_seen, pre_proto_novel = evaluator.eval_pretrain(model)
 
         trainer.train()
         # train() loads best-epoch weights and handles export internally.
@@ -530,14 +530,15 @@ class ExperimentRunner:
 
         # ── Pack RunScores ────────────────────────────────────────────
         run_scores = evaluator.collect(
-            run_id              = run_cfg.run_id,
-            paradigm            = run_cfg.paradigm,
-            arch                = run_cfg.arch,
-            pretrain_softmax    = pre_softmax,
-            pretrain_proto      = pre_proto,
-            trained_softmax     = tr_softmax,
-            trained_proto_seen  = tr_proto_seen,
-            trained_proto_novel = tr_proto_novel,
+            run_id               = run_cfg.run_id,
+            paradigm             = run_cfg.paradigm,
+            arch                 = run_cfg.arch,
+            pretrain_softmax     = pre_softmax,
+            pretrain_proto_seen  = pre_proto_seen,
+            pretrain_proto_novel = pre_proto_novel,
+            trained_softmax      = tr_softmax,
+            trained_proto_seen   = tr_proto_seen,
+            trained_proto_novel  = tr_proto_novel,
         )
 
         # ── Final HPs ────────────────────────────────────────────────
@@ -588,9 +589,8 @@ class ExperimentRunner:
         """Builds ExperimentSummary from all RunResults."""
 
         # Comparison table — {score_name: {run_id: top1_acc}}
-        score_names = ['pretrain_softmax', 'pretrain_proto',
-                       'trained_softmax',  'trained_proto_seen',
-                       'trained_proto_novel']
+        score_names = ['pretrain_softmax', 'pretrain_proto_seen', 'pretrain_proto_novel',
+                       'trained_softmax',  'trained_proto_seen', 'trained_proto_novel']
         comparison: Dict[str, Dict[str, float]] = {s: {} for s in score_names}
 
         for run_id, result in self.run_results.items():
@@ -752,6 +752,21 @@ class Plotter:
         red    = '#E24B4A'
         gray   = '#B4B2A9'
 
+        # Derive best epochs from history (min val_loss index)
+        pretrain_best_ep = None
+        train_best_ep    = None
+        if h.get('pretrain_val_loss'):
+            pretrain_best_ep = int(h['pretrain_val_loss'].index(min(h['pretrain_val_loss'])))
+        if h.get('val_loss'):
+            train_best_ep = int(h['val_loss'].index(min(h['val_loss'])))
+
+        # Proto novel reference values from run_scores
+        rs = result.run_scores if isinstance(result.run_scores, dict) else {}
+        pre_novel_acc = rs.get('pretrain_proto_novel', {}).get('top1_acc')
+        tr_novel_acc  = rs.get('trained_proto_novel',  {}).get('top1_acc')
+
+        total_epochs = pretrain_len + (len(train_ep_offset) if train_ep_offset else 0)
+
         for ax_idx, metric in enumerate(['loss', 'acc']):
             ax = axes[ax_idx]
 
@@ -764,9 +779,9 @@ class Plotter:
                 ax.plot(ep, vl, color=orange, linewidth=1.5)
 
                 # Best pretrain epoch marker
-                best_pretrain_ep = ts.get('pretrain_best_epoch', None)
-                if best_pretrain_ep is not None and best_pretrain_ep < len(vl):
-                    ax.plot(best_pretrain_ep, vl[best_pretrain_ep], 'o', color=red, markersize=6, zorder=5)
+                if pretrain_best_ep is not None and pretrain_best_ep < len(vl):
+                    ax.plot(pretrain_best_ep, vl[pretrain_best_ep],
+                            'o', color=red, markersize=6, zorder=5)
 
             # ── Train lines (dashed, offset) ──────────────────────────
             if has_train:
@@ -776,17 +791,32 @@ class Plotter:
                 ax.plot(train_ep_offset, vl, color=orange, linewidth=1.5, linestyle='--')
 
                 # Best train epoch marker
-                best_train_ep = ts.get('best_epoch', None)
-                if best_train_ep is not None and best_train_ep < len(vl):
-                    ax.plot(train_ep_offset[best_train_ep], vl[best_train_ep], 'o', color=red, markersize=6, zorder=5)
+                if train_best_ep is not None and train_best_ep < len(vl):
+                    ax.plot(train_ep_offset[train_best_ep], vl[train_best_ep],
+                            'o', color=red, markersize=6, zorder=5)
 
             # ── Phase separator ───────────────────────────────────────
             if has_pretrain and has_train:
-                ax.axvline(x=pretrain_len - 0.5, color=gray,
-                           linestyle=':', linewidth=0.8)
+                ax.axvline(x=pretrain_len - 0.5, color=gray, linestyle=':', linewidth=0.8)
                 ylim = ax.get_ylim()
                 ax.text(pretrain_len - 1, ylim[1], 'pretrain', ha='right', va='top', fontsize=8, color=gray)
-                ax.text(pretrain_len,     ylim[1], 'train', ha='left',  va='top', fontsize=8, color=gray)
+                ax.text(pretrain_len,     ylim[1], 'train',    ha='left',  va='top', fontsize=8, color=gray)
+
+            # ── Proto novel reference lines (accuracy plot only) ──────
+            if ax_idx == 1:
+                green = '#1D9E75'
+                if pre_novel_acc is not None:
+                    ax.axhline(y=pre_novel_acc, color=green, linewidth=1.0,
+                               linestyle='-.', alpha=0.8)
+                    ax.text(total_epochs + 0.5, pre_novel_acc,
+                            f' pre novel={pre_novel_acc:.2f}',
+                            va='center', fontsize=7.5, color=green)
+                if tr_novel_acc is not None:
+                    ax.axhline(y=tr_novel_acc, color=red, linewidth=1.0,
+                               linestyle='-.', alpha=0.8)
+                    ax.text(total_epochs + 0.5, tr_novel_acc,
+                            f' tr novel={tr_novel_acc:.2f}',
+                            va='center', fontsize=7.5, color=red)
 
             ax.set_title('Loss' if metric == 'loss' else 'Accuracy', fontsize=11)
             ax.set_xlabel('Epoch', fontsize=9)
@@ -795,13 +825,14 @@ class Plotter:
 
         # ── Shared legend ─────────────────────────────────────────────
         legend_elements = [
-            mpatches.Patch(color=blue,   label='train'),
-            mpatches.Patch(color=orange, label='val'),
-            plt.Line2D([0],[0], color='gray', linestyle='--', label='train phase'),
-            plt.Line2D([0],[0], color=red, marker='o', linestyle='None', markersize=6, label='best epoch'),
+            mpatches.Patch(color=blue,        label='train'),
+            mpatches.Patch(color=orange,      label='val'),
+            plt.Line2D([0],[0], color='gray',     linestyle='--',  label='train phase'),
+            plt.Line2D([0],[0], color=red,         marker='o', linestyle='None', markersize=6, label='best epoch'),
+            plt.Line2D([0],[0], color='#1D9E75',  linestyle='-.',  label='pretrain proto novel'),
+            plt.Line2D([0],[0], color=red,         linestyle='-.',  label='trained proto novel'),
         ]
-        fig.legend(handles=legend_elements, loc='lower center', ncol=4, fontsize=9, frameon=False, 
-                   bbox_to_anchor=(0.5, -0.02))
+        fig.legend(handles=legend_elements, loc='lower center', ncol=4, fontsize=9, frameon=False, bbox_to_anchor=(0.5, -0.02))
 
         plt.tight_layout(rect=[0, 0.06, 1, 1])
         path = os.path.join(self.plots_dir, f"{result.run_id}_curves.png")
@@ -812,96 +843,113 @@ class Plotter:
 
     def score_comparison(self, summary: ExperimentSummary, show: bool = True):
         """
-        Bar chart: 3 trained scores × 6 runs grouped by arch → paradigm.
+        Bar chart grouped by arch → 3 metric pairs (pretrain/trained thin bars).
+        Each arch has 6 thin bars:
+          softmax pair (pretrain light / trained dark)
+          proto seen pair (pretrain light / trained dark)
+          proto novel pair (pretrain light / trained dark) ★
+        Medium gap between pairs, larger gap between archs.
         """
         try:
             import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
             import numpy as np
         except ImportError:
             raise ImportError("pip install matplotlib")
 
-        # ── Data ─────────────────────────────────────────────────────
         ct = summary.comparison_table
-        metrics = ['trained_softmax', 'trained_proto_seen', 'trained_proto_novel']
-        metric_labels = ['Softmax', 'Proto Seen', 'Proto Novel ★']
 
-        # Fixed order: arch → paradigm
+        # Fixed run order: arch → paradigm (std then few per arch)
         run_order = [
             'run1_cnn_standard', 'run2_cnn_fewshot',
             'run3_gnn_standard', 'run4_gnn_fewshot',
             'run5_hybrid_standard', 'run6_hybrid_fewshot',
         ]
-        # Only keep runs that exist in results
         run_order = [r for r in run_order if r in next(iter(ct.values()))]
+        arch_labels = ['CNN', 'GNN', 'Hybrid']
 
-        arch_labels  = ['CNN', 'GNN', 'Hybrid']
-        colors       = {
-            'trained_softmax'     : ('#7F77DD', '#AFA9EC'),  # (std, few)
-            'trained_proto_seen'  : ('#EF9F27', '#FAC775'),
-            'trained_proto_novel' : ('#E24B4A', '#F09595'),
-        }
+        # Metric pairs: (pretrain_key, trained_key, label, light_color, dark_color)
+        pairs = [
+            ('pretrain_softmax',     'trained_softmax',     'softmax',     '#AFA9EC', '#7F77DD'),
+            ('pretrain_proto_seen',  'trained_proto_seen',  'proto seen',  '#FAC775', '#EF9F27'),
+            ('pretrain_proto_novel', 'trained_proto_novel', 'proto novel', '#F09595', '#E24B4A'),
+        ]
 
-        n_metrics  = len(metrics)
         n_archs    = 3
-        arch_width = 0.7          # total width per arch group
-        bar_width  = arch_width / (n_metrics * 2 + (n_metrics - 1) * 0.3)
-        metric_gap = bar_width * 0.3
+        n_pairs    = len(pairs)
+        thin_w     = 0.07    # width of each thin bar
+        pair_gap   = 0.04    # gap between 2 bars in a pair
+        metric_gap = 0.09    # gap between metric pairs
+        arch_gap   = 0.20    # extra gap between arch groups
 
-        fig, ax = plt.subplots(figsize=(12, 5))
+        # Total width per arch group
+        pair_w    = 2 * thin_w + pair_gap
+        group_w   = n_pairs * pair_w + (n_pairs - 1) * metric_gap
+        arch_step = group_w + arch_gap
+
+        fig, ax = plt.subplots(figsize=(13, 5))
 
         for ai in range(n_archs):
-            arch_center = ai * 1.0
-            std_run = run_order[ai * 2]
-            few_run = run_order[ai * 2 + 1]
+            arch_x   = ai * arch_step
+            std_run  = run_order[ai * 2]     if ai * 2     < len(run_order) else None
+            few_run  = run_order[ai * 2 + 1] if ai * 2 + 1 < len(run_order) else None
 
-            # start x for first bar in this arch group
-            total_w = n_metrics * 2 * bar_width + (n_metrics - 1) * metric_gap
-            x_start = arch_center - total_w / 2
+            for pi, (pre_key, tr_key, label, light_c, dark_c) in enumerate(pairs):
+                x_pair = arch_x + pi * (pair_w + metric_gap)
 
-            for mi, (metric, mlabel) in enumerate(zip(metrics, metric_labels)):
-                x_metric = x_start + mi * (2 * bar_width + metric_gap)
-                std_val  = ct[metric].get(std_run, 0) or 0
-                few_val  = ct[metric].get(few_run, 0) or 0
-                c_std, c_few = colors[metric]
+                # Pretrain bar (std run — both std/few share same pretrain)
+                pre_val = ct.get(pre_key, {}).get(std_run, 0) or 0
+                ax.bar(x_pair, pre_val, thin_w,
+                       color=light_c,
+                       label=f'pretrain {label}' if ai == 0 else '')
 
-                ax.bar(x_metric,              std_val, bar_width,
-                       color=c_std, label=f'{mlabel} std' if ai == 0 else '')
-                ax.bar(x_metric + bar_width,  few_val, bar_width,
-                       color=c_few, label=f'{mlabel} few' if ai == 0 else '')
+                # Trained bar (avg of std and few, or just std — use std for clarity)
+                tr_val = ct.get(tr_key, {}).get(std_run, 0) or 0
+                ax.bar(x_pair + thin_w + pair_gap, tr_val, thin_w,
+                       color=dark_c,
+                       label=f'trained {label}' if ai == 0 else '')
 
-                # metric label below bars
-                if ai == 0:
-                    ax.text(x_metric + bar_width, -0.06, mlabel,
-                            ha='center', va='top', fontsize=7.5,
-                            color='#888780', transform=ax.transData)
+                # Metric label below
+                mid_x = x_pair + thin_w + pair_gap / 2
+                ax.text(mid_x, -0.04, label,
+                        ha='center', va='top', fontsize=7.5, color='#888780',
+                        transform=ax.transData)
 
-        # ── Arch labels + separators ──────────────────────────────────
-        for ai, arch in enumerate(arch_labels):
-            ax.text(ai * 1.0, 1.02, arch, ha='center', va='bottom',
-                    fontsize=11, fontweight='bold', color='#444441')
+                # ★ marker for proto novel
+                if pi == 2:
+                    ax.text(mid_x, pre_val + 0.01, '★',
+                            ha='center', va='bottom', fontsize=8, color='#E24B4A')
+
+            # Arch label above group
+            group_mid = arch_x + group_w / 2
+            ax.text(group_mid, 1.02, arch_labels[ai],
+                    ha='center', va='bottom', fontsize=11,
+                    fontweight='bold', color='#444441')
+
+            # Arch separator
             if ai > 0:
-                ax.axvline(ai - 0.5, color='#B4B2A9', linewidth=0.8,
+                sep_x = arch_x - arch_gap / 2
+                ax.axvline(sep_x, color='#B4B2A9', linewidth=0.8,
                            linestyle='--', alpha=0.5)
 
-        # ── Std / Few legend markers ──────────────────────────────────
-        from matplotlib.patches import Patch
+        # Legend
         legend_elements = [
-            Patch(facecolor='#7F77DD', label='Standard — softmax'),
-            Patch(facecolor='#AFA9EC', label='FewShot  — softmax'),
-            Patch(facecolor='#EF9F27', label='Standard — proto seen'),
-            Patch(facecolor='#FAC775', label='FewShot  — proto seen'),
-            Patch(facecolor='#E24B4A', label='Standard — proto novel ★'),
-            Patch(facecolor='#F09595', label='FewShot  — proto novel ★'),
+            mpatches.Patch(facecolor='#AFA9EC', label='pretrain softmax'),
+            mpatches.Patch(facecolor='#7F77DD', label='trained softmax'),
+            mpatches.Patch(facecolor='#FAC775', label='pretrain proto seen'),
+            mpatches.Patch(facecolor='#EF9F27', label='trained proto seen'),
+            mpatches.Patch(facecolor='#F09595', label='pretrain proto novel ★'),
+            mpatches.Patch(facecolor='#E24B4A', label='trained proto novel ★'),
         ]
         ax.legend(handles=legend_elements, fontsize=8, ncol=3,
-                  loc='upper center', bbox_to_anchor=(0.5, -0.12),
-                  frameon=False)
+                  loc='upper center', bbox_to_anchor=(0.5, -0.12), frameon=False)
 
-        ax.set_xlim(-0.55, 2.55)
+        total_w = n_archs * arch_step - arch_gap
+        ax.set_xlim(-0.1, total_w + 0.1)
         ax.set_ylim(0, 1.08)
         ax.set_xticks([])
         ax.set_ylabel('Accuracy (top-1)', fontsize=10)
-        ax.set_title('Trained Model Results — Grouped by Architecture',
+        ax.set_title('Pretrain vs Trained Results — Grouped by Architecture',
                      fontsize=12, pad=14)
         ax.yaxis.grid(True, alpha=0.15)
         ax.set_axisbelow(True)
@@ -979,14 +1027,16 @@ class Plotter:
                         if novel_lo is not None else '—')
 
             row = {
-                'Arch'            : result.arch.upper(),
-                'Paradigm'        : result.paradigm.capitalize(),
-                'Pretrain Eval %' : acc('pretrain_softmax'),
-                'Softmax %'       : acc('trained_softmax'),
-                'Proto Seen %'    : acc('trained_proto_seen'),
-                'Proto Novel %'   : acc('trained_proto_novel'),
-                '95% CI'          : ci_str,
-                'Time (min)'      : int(round(result.duration_seconds / 60, 0)),
+                'Arch'              : result.arch.upper(),
+                'Paradigm'          : result.paradigm.capitalize(),
+                'Pre Softmax %'     : acc('pretrain_softmax'),
+                'Pre Proto Seen %'  : acc('pretrain_proto_seen'),
+                'Pre Proto Novel %' : acc('pretrain_proto_novel'),
+                'Tr Softmax %'      : acc('trained_softmax'),
+                'Tr Proto Seen %'   : acc('trained_proto_seen'),
+                'Tr Proto Novel %'  : acc('trained_proto_novel'),
+                '95% CI'            : ci_str,
+                'Time (min)'        : int(round(result.duration_seconds / 60, 0)),
             }
 
             if show_hps and result.best_hps:
@@ -997,7 +1047,8 @@ class Plotter:
         df = pd.DataFrame(rows)
 
         # ── Highlight helpers ─────────────────────────────────────────────
-        highlight_high = ['Pretrain Eval %', 'Softmax %', 'Proto Seen %', 'Proto Novel %']
+        highlight_high = ['Pre Softmax %', 'Pre Novel Seen %', 'Pre Proto Novel %',
+                          'Tr Softmax %', 'Tr Proto Seen %', 'Tr Proto Novel %']
         highlight_low  = ['Time (min)']   # lower is better
 
         GREEN_BG  = 'background-color: #c6efce; color: #276221; font-weight: bold'
@@ -1029,11 +1080,13 @@ class Plotter:
 
         # ── Build styler ──────────────────────────────────────────────────
         fmt = {
-            'Pretrain Eval %' : '{:.2f}',
-            'Softmax %'       : '{:.2f}',
-            'Proto Seen %'    : '{:.2f}',
-            'Proto Novel %'   : '{:.2f}',
-            'Time (min)'      : '{:.0f}',
+            'Pre Softmax %'     : '{:.2f}',
+            'Pre Proto Seen %'  : '{:.2f},
+            'Pre Proto Novel %' : '{:.2f},
+            'Tr Softmax %'      : '{:.2f}',
+            'Tr Proto Seen %'   : '{:.2f}',
+            'Tr Proto Novel %'  : '{:.2f}',
+            'Time (min)'        : '{:.0f}',
         }
         if show_hps:
             fmt['Best HPs'] = '{}'

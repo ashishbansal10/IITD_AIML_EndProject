@@ -55,6 +55,36 @@ Required Libraries
 # torch>=2.0.0
 # pytorch-lightning>=2.0.0  # pretrain phase — pip install pytorch-lightning
 # tqdm>=4.0.0               # train phase — pip install tqdm
+
+[FUTURE WORK] Elastic Weight Consolidation (EWC)
+
+The primary experimental finding of this study is that the train phase 
+consistently degrades novel class generalisation across all 6 runs — 
+proto_novel drops from pretrain level in every architecture and paradigm 
+combination. EWC directly addresses this by constraining backbone weights 
+to stay close to the pretrain checkpoint during the train phase, weighted 
+by their importance to pretrain performance.
+
+Implementation requires:
+  1. After pretrain() — estimate Fisher information via 50-batch 
+     forward pass on pretrain pool (~2 min)
+  2. Store pretrain checkpoint weights as frozen reference θ*
+  3. During train phase — add EWC penalty to every loss computation:
+     total_loss = task_loss + λ * Σ F_i * (θ_i - θ*_i)²
+
+Expected benefit: proto_novel accuracy maintained near pretrain level 
+(~0.82-0.86 proto_seen quality) rather than degrading to 0.63-0.69 
+as observed in Run 2. This would validate the pretrain checkpoint as 
+the optimal starting point for novel class generalisation and confirm 
+that the train phase degrades rather than improves novel class features.
+
+λ tuning required: start at λ=1000, reduce if train loss cannot improve.
+Complementary to existing L2 regularisation (weight_decay) — addresses
+a different problem (forgetting vs overfitting) and should be used 
+alongside weight_decay, not as a replacement.
+
+Reference: Kirkpatrick, J. et al. (2017). Overcoming catastrophic 
+forgetting in neural networks. PNAS, 114(13), 3521–3526.
 """
 
 import os
@@ -112,7 +142,6 @@ class TrainConfig:
 
     # ── Core ──────────────────────────────────────────────────────────
     lr:                   float = 1e-3
-    weight_decay:         float = 1e-4
     epochs_pretrain:      int   = 100
     epochs_train:         int   = 100
 
@@ -122,7 +151,9 @@ class TrainConfig:
     lr_decay_gamma:       float = 0.5
 
     # ── Regularization ────────────────────────────────────────────────
-    grad_clip:            Optional[float] = None   # None = disabled
+    weight_decay:         float = 1e-4              # ← L2 regularisation — penalty on weight magnitude
+    label_smoothing:      float = 0.1
+    grad_clip:            Optional[float] = None    # None = disabled
 
     # ── Early stopping ────────────────────────────────────────────────
     early_stop_patience:  int   = 10
@@ -425,7 +456,7 @@ class LightningModuleWrapper:
                 self_inner.log('val_acc',  acc,  prog_bar=True, on_step=False, on_epoch=True)
 
             def configure_optimizers(self_inner):
-                optimizer = torch.optim.Adam(
+                optimizer = torch.optim.AdamW(
                     model.trainable_param_groups(
                         lr_map     = config.lr_map,
                         default_lr = config.lr
@@ -601,7 +632,7 @@ class TrainerImpl:
             _episodic_epoch()           — single episodic epoch (train or eval)
         _run_train_lightning()      — [FUTURE] standard train via Lightning
         
-        _setup_optimizer()          — Adam with optional per-component lr
+        _setup_optimizer()          — AdamW with optional per-component lr
         _setup_scheduler()          — step/cosine/none
         _is_improved()              — val_loss improvement check
         _early_stopping_check()     — returns True if should stop
@@ -641,7 +672,7 @@ class TrainerImpl:
         self.state   = TrainingState()
         self.history = TrainingHistory()
 
-        self._criterion = nn.CrossEntropyLoss()
+        self._criterion = nn.CrossEntropyLoss(label_smoothing=self.config.label_smoothing)
 
         # Private working checkpoint paths — internal to TrainerImpl only.
         # Written by training loops on each improvement.
@@ -1043,8 +1074,7 @@ class TrainerImpl:
                 total_loss += loss.item()
                 total_acc  += acc
                 n_episodes += 1
-                pbar.set_postfix({'loss': f'{loss.item():.4f}',
-                                   'acc':  f'{acc:.4f}'})
+                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc':  f'{acc:.4f}'})
 
         return total_loss / max(n_episodes, 1), total_acc / max(n_episodes, 1)
 
@@ -1097,7 +1127,7 @@ class TrainerImpl:
 
     def _setup_optimizer(self) -> torch.optim.Optimizer:
         """
-        Adam optimizer.
+        AdamW optimizer.
         Uses per-component lr_map if provided in config.
         Otherwise uses single lr for all trainable params.
         """
@@ -1105,7 +1135,7 @@ class TrainerImpl:
             lr_map     = self.config.lr_map,
             default_lr = self.config.lr
         )
-        return torch.optim.Adam(
+        return torch.optim.AdamW(
             param_groups,
             lr           = self.config.lr,
             weight_decay = self.config.weight_decay
