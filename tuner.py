@@ -41,7 +41,6 @@ Framework Integration Notes
 [CONFIRMED] Optuna integrated here for learning purposes.
 [CONFIRMED] hydra  — cut, stub in ModelConfig.from_yaml()
 [CONFIRMED] torch.fx — cut, stub in CompositeModel._execute_graph()
-[CONFIRMED] Lightning — pretrain phase, LightningModuleWrapper
 [CONFIRMED] Optuna — tuner.py, 4-trial grid
 
 Required Libraries
@@ -51,6 +50,8 @@ Required Libraries
 
 import copy
 import torch
+import logging
+import os
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any
 
@@ -63,39 +64,79 @@ from typing import Dict, List, Optional, Any
 class TuneConfig:
     """
     Hyperparameter tuning configuration.
-    Kept minimal — learning objective, not production search.
 
-    Search space (categorical — discrete choices, easy to reason about):
-        dropout_rate : [0.0, 0.2]    backbone dropout
-        lr           : [1e-4, 1e-3]  starting learning rate
+    User sets hp_choices and optionally model_hp_keys.
+    Sampler, pruner, n_trials are auto-selected internally.
 
-    Storage:
-        None              → in-memory study (lost after run)
-        'sqlite:///hp.db' → persistent study (resume across runs)
+    hp_choices — {hp_name: [choice1, choice2, ...]}
+        Pretrain: {'dropout_rate': [0.0, 0.1, 0.2], 'lr': [1e-4, 5e-4, 1e-3]}
+        Train:    {'temperature': [5.0, 10.0, 20.0],
+                   'label_smoothing': [0.0, 0.05, 0.1],
+                   'weight_decay': [1e-4, 5e-4]}
 
-    Pruning:
-        True  → Optuna stops bad trials early (MedianPruner)
-                saves time when a trial is clearly worse than median
-        False → all trials run to completion
+    model_hp_keys — hp names going to model components (not TrainConfig):
+        'dropout_rate' → backbone.set_hp(dropout_rate=v)
+        'temperature'  → prototypical head set_hp(temperature=v)
+        All others     → setattr(train_config, key, value)
+
+    Sampler auto-selected:
+        search_space_size <= 12 → GridSampler  (exhaustive)
+        search_space_size >  12 → TPESampler   (Bayesian)
+
+    Pruner auto-selected from effective n_trials:
+        <= 10 → NopPruner
+        <= 30 → MedianPruner
+        >  30 → HyperbandPruner
+
+    n_trials auto-selected:
+        GridSampler → product of all choice lengths
+        TPESampler  → min(search_space_size * 2, 30) unless overridden
+
+    proxy_epochs — short pretrain proxy for pretrain-phase tuning.
+        None = max(10, epochs_pretrain // 5)
+        Ignored for train-phase tuning (checkpoint reloaded instead).
 
     [FUTURE] Extend search space here when more HPs needed.
              Add float ranges: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
              Add integers:     trial.suggest_int('n_layers', 2, 5)
     """
 
-    # Trial control
-    n_trials:         int            = 4        # 2×2 full grid
-    study_name:       str            = 'hp_search'
-    storage:          Optional[str]  = None     # None=memory, 'sqlite:///hp.db'=persistent
-    pruning:          bool           = True
+    # ── Search space ──────────────────────────────────────────────────
+    # model_hp_choices: aliased names matching *_config() hp_overrides kwargs
+    #   e.g. {'backbone_dropout': [0.0, 0.1, 0.2], 'temperature': [5.0, 10.0]}
+    #   Applied via ModelFactory.create(hp_overrides=model_sampled)
+    #
+    # train_hp_choices: TrainConfig field names
+    #   e.g. {'label_smoothing': [0.0, 0.05, 0.1], 'weight_decay': [1e-4, 5e-4]}
+    #   Applied via setattr(train_config, k, v)
+    model_hp_choices: Dict[str, List[Any]] = field(default_factory=dict)
+    train_hp_choices: Dict[str, List[Any]] = field(default_factory=dict)
 
-    # Search space — categorical choices only
-    # dropout_rate: with or without dropout
-    dropout_choices:  List[float]    = field(default_factory=lambda: [0.0, 0.2])
-    # lr: low or standard starting lr
-    lr_choices:       List[float]    = field(default_factory=lambda: [1e-4, 1e-3])
+    # ── Optional ──────────────────────────────────────────────────────
+    n_trials:     Optional[int] = None   # None = auto from search space
+    proxy_epochs: Optional[int] = None   # None = epochs_pretrain // 5
+    study_name:   str           = 'hp_search'
+    storage:      Optional[str] = None   # None=memory, path=persistent
 
-    proxy_epochs: Optional[int] = None   # None = use default max(10, epochs//5)
+    def search_space_size(self) -> int:
+        """Product of all choice lengths across both model and train HPs."""
+        size = 1
+        for v in {**self.model_hp_choices, **self.train_hp_choices}.values():
+            size *= len(v)
+        return size
+
+    def effective_n_trials(self) -> int:
+        """Auto-compute n_trials if not set by user."""
+        if self.n_trials is not None:
+            return self.n_trials
+        size = self.search_space_size()
+        if size <= 12:
+            return size
+        return min(size * 2, 30)
+
+    def all_hp_choices(self) -> Dict[str, List[Any]]:
+        """Combined dict for Optuna sampling — all HPs together."""
+        return {**self.model_hp_choices, **self.train_hp_choices}
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -143,29 +184,59 @@ class HPTuner:
     def __init__(self,
                  model_config,
                  train_config,
-                 tune_config:  TuneConfig,
+                 tune_config:          TuneConfig,
                  factory,
-                 device:       torch.device):
+                 device:               torch.device,
+                 run_id:               str           = 'run',
+                 paradigm:             str           = 'standard',
+                 logs_dir:             str           = 'logs',
+                 load_checkpoint_path: Optional[str] = None):
         """
         Args:
-            model_config : ModelConfig — architecture definition
-            train_config : TrainConfig — base training config (copied per trial)
-            tune_config  : TuneConfig  — search space + trial control
-            factory      : SmartDataLoaderFactory
-            device       : torch.device — from notebook
+            model_config          : ModelConfig — architecture definition
+            train_config          : TrainConfig — base training config (copied per trial)
+            tune_config           : TuneConfig  — search space + trial control
+            factory               : SmartDataLoaderFactory
+            device                : torch.device
+            run_id                : str — run identifier for log filename
+            paradigm              : 'standard' or 'fewshot' — selects trainer class
+            logs_dir              : str — directory for detailed log files
+            load_checkpoint_path  : str or None
+                                    None  = pretrain-phase tuning (runs proxy pretrain)
+                                    path  = train-phase tuning (reloads checkpoint, skips pretrain)
         """
-        self.model_config = model_config
-        self.train_config = train_config
-        self.tune_config  = tune_config
-        self.factory      = factory
-        self.device       = device
+        self.model_config         = model_config
+        self.train_config         = train_config
+        self.tune_config          = tune_config
+        self.factory              = factory
+        self.device               = device
+        self.run_id               = run_id
+        self.paradigm             = paradigm
+        self.load_checkpoint_path = load_checkpoint_path
 
         # Best HPs found — populated after run()
         self.best_hps:    Dict[str, Any] = {}
         self.best_trial:  Optional[Any]  = None
 
+        # ── Logger — detailed output to file, minimal to stdout ───────
+
+        os.makedirs(logs_dir, exist_ok=True)
+        phase = 'train' if load_checkpoint_path else 'pretrain'
+        log_path = os.path.join(logs_dir, f"{run_id}_tuner_{phase}.log")
+
+        self._logger = logging.getLogger(f"tuner.{run_id}.{phase}")
+        self._logger.setLevel(logging.DEBUG)
+        self._logger.handlers.clear()
+
+        fh = logging.FileHandler(log_path, mode='w')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        self._logger.addHandler(fh)
+        self._log_path = log_path
+
         try:
             import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)  # suppress Optuna stdout
             self._optuna = optuna
         except ImportError:
             raise ImportError(
@@ -174,164 +245,182 @@ class HPTuner:
                 "Or set tune_config=None in ExperimentConfig to skip tuning."
             )
 
+    def _select_sampler(self):
+        """Auto-select sampler based on combined search space size."""
+        size     = self.tune_config.search_space_size()
+        all_hps  = self.tune_config.all_hp_choices()
+        if size <= 12:
+            self._logger.info(f"Sampler: GridSampler (space_size={size})")
+            return self._optuna.samplers.GridSampler(all_hps)
+        self._logger.info(f"Sampler: TPESampler (space_size={size})")
+        return self._optuna.samplers.TPESampler()
+
+    def _select_pruner(self, n_trials: int):
+        """Auto-select pruner based on effective n_trials."""
+        if n_trials <= 10:
+            self._logger.info(f"Pruner: NopPruner (n_trials={n_trials})")
+            return self._optuna.pruners.NopPruner()
+        elif n_trials <= 30:
+            self._logger.info(f"Pruner: MedianPruner (n_trials={n_trials})")
+            return self._optuna.pruners.MedianPruner()
+        self._logger.info(f"Pruner: HyperbandPruner (n_trials={n_trials})")
+        return self._optuna.pruners.HyperbandPruner()
+
     def run(self) -> Dict[str, Any]:
         """
-        Run Optuna study — n_trials total.
+        Run Optuna study.
+        Sampler, pruner, n_trials auto-selected from TuneConfig.
         Returns best HPs found as dict.
-
-        Returns:
-            {'dropout_rate': float, 'lr': float}
         """
-        optuna = self._optuna
+        optuna   = self._optuna
+        n_trials = self.tune_config.effective_n_trials()
+        sampler  = self._select_sampler()
+        pruner   = self._select_pruner(n_trials)
 
-        # Pruner — stops bad trials early based on median performance
-        pruner = (optuna.pruners.MedianPruner()
-                  if self.tune_config.pruning
-                  else optuna.pruners.NopPruner())
-
-        # Create or load study
         study = optuna.create_study(
-            study_name = self.tune_config.study_name,
-            storage    = self.tune_config.storage,
-            direction  = 'minimize',    # minimize val_loss
-            pruner     = pruner,
+            study_name     = self.tune_config.study_name,
+            storage        = self.tune_config.storage,
+            direction      = 'minimize',    # minimize val_loss
+            sampler        = sampler,
+            pruner         = pruner,
             load_if_exists = True       # resume if storage set + study exists
         )
 
-        print(f"\n{'='*60}")
-        print(f"HP TUNING — {self.tune_config.n_trials} trials")
-        print(f"Search space:")
-        print(f"  dropout_rate : {self.tune_config.dropout_choices}")
-        print(f"  lr           : {self.tune_config.lr_choices}")
-        print(f"Objective      : pretrain val_loss (proxy)")
-        print(f"{'='*60}")
+        phase = 'train' if self.load_checkpoint_path else 'pretrain'
+        print(f"  Tuner started [{self.run_id} | {phase} | {n_trials} trials | space={self.tune_config.search_space_size()}]")
+        self._logger.info(f"Tuner started — run_id={self.run_id} phase={phase} n_trials={n_trials}")
+        self._logger.info(f"Search space model: {self.tune_config.model_hp_choices}")
+        self._logger.info(f"Search space train: {self.tune_config.train_hp_choices}")
+        self._logger.info(f"Objective: {'train val_loss (reusing pretrain ckpt)' if self.load_checkpoint_path else 'pretrain val_loss (proxy)'}")
 
         study.optimize(
             self._objective,
-            n_trials  = self.tune_config.n_trials,
-            callbacks = [self._trial_callback]
+            n_trials  = n_trials,
+            callbacks = [self._trial_callback],
         )
 
         self.best_trial = study.best_trial
         self.best_hps   = study.best_trial.params
 
-        print(f"\n  Best trial : {study.best_trial.number}")
-        print(f"  Best val_loss : {study.best_trial.value:.4f}")
-        print(f"  Best HPs   : {self.best_hps}")
+        self._logger.info(f"Tuner complete — best_trial={study.best_trial.number} best_value={study.best_trial.value:.4f} best_hps={self.best_hps}")
+        print(f"  Tuner complete [{self.run_id}] — best_val={study.best_trial.value:.4f} hps={self.best_hps} log={self._log_path}")
 
         return self.best_hps
-
-    # ------------------------------------------------------------------
-    # Objective — one trial
-    # ------------------------------------------------------------------
 
     def _objective(self, trial) -> float:
         """
         Single Optuna trial.
-        Samples HPs → applies to fresh model copy → runs pretrain → returns val_loss.
 
-        Fresh model per trial — original model untouched.
-        TrainConfig copied per trial — original config untouched.
+        Pretrain tuning (load_checkpoint_path=None):
+            Samples HPs from hp_choices → runs proxy pretrain → returns val_loss
+
+        Train tuning (load_checkpoint_path set):
+            Samples HPs from hp_choices → reloads checkpoint → runs train → returns val_loss
         """
-        from model_factory import ModelFactory
-        from trainer       import StandardTrainer
+        from trainer import StandardTrainer, FewShotTrainer
+        import torch
+        import gc
 
-        # ── Sample HPs ────────────────────────────────────────────────
-        dropout_rate = trial.suggest_categorical(
-            'dropout_rate', self.tune_config.dropout_choices
-        )
-        lr = trial.suggest_categorical(
-            'lr', self.tune_config.lr_choices
-        )
+        # ── Sample train HPs always ───────────────────────────────────
+        train_sampled = {}
+        for hp_name, choices in self.tune_config.train_hp_choices.items():
+            train_sampled[hp_name] = trial.suggest_categorical(hp_name, choices)
 
-        print(f"\n  Trial {trial.number} | dropout_rate={dropout_rate} lr={lr}")
+        # ── Sample model HPs only in pretrain-phase tuning ────────────
+        # When load_checkpoint_path set (train-phase tuning), model is fixed —
+        # model HPs cannot meaningfully change loaded weights.
+        model_sampled = {}
+        if not self.load_checkpoint_path:
+            for hp_name, choices in self.tune_config.model_hp_choices.items():
+                model_sampled[hp_name] = trial.suggest_categorical(hp_name, choices)
 
-        # ── Fresh model copy per trial ─────────────────────────────────
-        # Original model_config untouched — copy with overridden dropout
-        trial_model_config = self._build_trial_model_config(dropout_rate)
-        trial_model        = ModelFactory.create(trial_model_config,
-                                                  device=self.device)
+        self._logger.info(f"Trial {trial.number} | model_hps={model_sampled} train_hps={train_sampled}")
 
-        # ── Fresh TrainConfig copy per trial ──────────────────────────
-        trial_train_config      = copy.deepcopy(self.train_config)
-        trial_train_config.lr   = lr
-        # Shorten pretrain for tuning — proxy, not full train
-        # Use 20% of full epochs — enough signal for relative comparison
-        if self.tune_config.proxy_epochs is not None:
-            trial_train_config.epochs_pretrain = self.tune_config.proxy_epochs
+        # ── Fresh model — apply model HPs via ModelConfig.update_config ──
+        from model_factory import ModelFactory, ModelConfig
+        if model_sampled:
+            trial_model_config = ModelConfig.update_config(self.model_config, **model_sampled)
         else:
-            trial_train_config.epochs_pretrain = max(
-                10,
-                self.train_config.epochs_pretrain // 5
-            )
+            trial_model_config = self.model_config
+        trial_model = ModelFactory.create(trial_model_config, device=self.device)
 
-        # ── Run pretrain as proxy ─────────────────────────────────────
-        # StandardTrainer used for both paradigms during tuning —
-        # pretrain is identical for both (batch mode)
-        trainer = StandardTrainer(
-            trial_model, self.factory, trial_train_config, self.device
-        )
-        trainer.pretrain()
+        # ── Fresh TrainConfig copy — apply train HPs via setattr ──────
+        trial_train_config = copy.deepcopy(self.train_config)
+        for k, v in train_sampled.items():
+            if hasattr(trial_train_config, k):
+                setattr(trial_train_config, k, v)
+            else:
+                self._logger.warning(f"Train HP '{k}' not in TrainConfig — skipped")
 
-        val_loss = trainer.impl.state.best_val_loss
+        if self.load_checkpoint_path:
+            # ── Train-phase tuning — reload pretrain checkpoint ───────
+            state_dict = torch.load(self.load_checkpoint_path, map_location=self.device)
+            trial_model.load_state_dict(state_dict)
+            self._logger.info(f"Trial {trial.number} | loaded pretrain ckpt: {self.load_checkpoint_path}")
+        else:
+            # ── Pretrain-phase tuning — shorten epochs for proxy ──────
+            epochs = (self.tune_config.proxy_epochs
+                      if self.tune_config.proxy_epochs is not None
+                      else max(10, self.train_config.epochs_pretrain // 5))
+            trial_train_config.epochs_pretrain = epochs
 
-        # ── Report intermediate value for pruning ─────────────────────
-        trial.report(val_loss, step=trial_train_config.epochs_pretrain)
+        TrainerClass = StandardTrainer if self.paradigm == 'standard' else FewShotTrainer
+        trainer = TrainerClass(trial_model, self.factory, trial_train_config, self.device)
+
+        try:
+            if self.load_checkpoint_path:
+                trainer.impl.state.is_pretrained = True
+                trainer.train()
+            else:
+                trainer.pretrain()
+
+            val_metric = trainer.impl.state.best_val_loss
+            self._logger.info(f"Trial {trial.number} | val_metric={val_metric:.4f}")
+
+        except self._optuna.exceptions.TrialPruned:
+            raise
+        except Exception as e:
+            self._logger.error(f"Trial {trial.number} failed: {e}")
+            raise
+        finally:
+            del trainer
+            del trial_model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        trial.report(val_metric, step=1)
         if trial.should_prune():
             raise self._optuna.exceptions.TrialPruned()
 
-        return val_loss
+        return val_metric
 
-    def _build_trial_model_config(self, dropout_rate: float):
-        """
-        Builds a ModelConfig copy with dropout_rate applied to backbone.
-        Original model_config untouched.
-
-        Deep copies the config dict, overrides backbone dropout_rate.
-        Works for cnn_config, gnn_config, hybrid_config — all have 'backbone'.
-        """
-        cfg_dict = self.model_config.to_dict()
-        cfg_dict = copy.deepcopy(cfg_dict)
-
-        backbone = cfg_dict['components']['backbone']
-
-        if isinstance(backbone, list):
-            # SubChain (hybrid) — apply to first member (CNN backbone)
-            backbone[0]['dropout_rate'] = dropout_rate
-        elif isinstance(backbone, dict):
-            # Single backbone (cnn, gnn)
-            backbone['dropout_rate'] = dropout_rate
-
-        from model_factory import ModelConfig
-        return ModelConfig.from_dict(cfg_dict)
 
     # ------------------------------------------------------------------
     # Callback
     # ------------------------------------------------------------------
 
     def _trial_callback(self, study, trial):
-        """Prints trial summary after each trial completes."""
-        print(f"  Trial {trial.number} complete | "
-              f"val_loss={trial.value:.4f} | "
-              f"params={trial.params} | "
-              f"best so far={study.best_value:.4f}")
+        """Logs trial summary to file — no stdout."""
+        self._logger.info(
+            f"Trial {trial.number} complete | "
+            f"val={trial.value:.4f} | "
+            f"params={trial.params} | "
+            f"best_so_far={study.best_value:.4f}"
+        )
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
 
     def print_summary(self):
-        """Prints full tuning results after run() completes."""
+        """Logs full tuning summary to file. Brief stdout only."""
         if not self.best_trial:
-            print("No trials completed yet. Call run() first.")
+            print("  Tuner: no trials completed.")
             return
-
-        print(f"\n{'='*60}")
-        print(f"TUNING SUMMARY — {self.tune_config.study_name}")
-        print(f"{'='*60}")
-        print(f"  Best trial    : {self.best_trial.number}")
-        print(f"  Best val_loss : {self.best_trial.value:.4f}")
-        print(f"  Best HPs:")
+        self._logger.info(f"=== TUNING SUMMARY === study={self.tune_config.study_name}")
+        self._logger.info(f"Best trial: {self.best_trial.number}")
+        self._logger.info(f"Best val:   {self.best_trial.value:.4f}")
         for k, v in self.best_hps.items():
-            print(f"      {k:20s} : {v}")
-        print(f"{'='*60}")
+            self._logger.info(f"  {k}: {v}")
+        print(f"  Tuner summary written to {self._log_path}")

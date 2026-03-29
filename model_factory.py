@@ -22,10 +22,7 @@ Required Libraries
 # torchvision>=0.15.0
 # easyfsl>=1.4.0              # ResNet12, Conv4 — pip install easyfsl
 # torch_geometric>=2.3.0      # GATRelationalLayer, GNNBackbone — pip install torch_geometric
-# pyyaml>=6.0                 # ModelConfig.from_yaml() — pip install pyyaml
 # optuna>=3.0.0               # HP tuning (tuner.py) — pip install optuna
-# pytorch-lightning>=2.0.0    # trainer.py — pip install pytorch-lightning
-# hydra-core>=1.3.0           # future: ModelConfig.from_hydra() — pip install hydra-core
 # timm>=0.9.0                 # optional fallback for other architectures — pip install timm
 
 Registered Components
@@ -69,15 +66,14 @@ Level 2 — ModelConfig dict  : override at config definition time
            All keys except 'name', 'role' and 'repeat' in component dict
            are passed as **kwargs to ComponentModel.__init__
            e.g. 'backbone': {'name':'resnet12','role':'backbone','dropout_rate':0.1}
-Level 3 — HP Tuner (Optuna) : override at trial time via component.set_hp(**kwargs)
-           tuner.py: model.get_component('backbone').set_hp(dropout_rate=0.2)
+Level 3 — HP Tuner (Optuna) : override at trial time via ModelConfig.update_config(**kwargs)
 
 HP params per component:
     BasicCNN          : no HP config — fixed for testing only
     Conv4             : dropout_rate(0.0)  [easyfsl fixed arch — dropout as wrapper]
     ResNet12          : dropout_rate(0.0)  [easyfsl fixed arch — dropout as wrapper]
     Linear            : embed_dim(*), n_classes(*), dropout_rate(0.0)
-    PrototypicalNet   : n_way(5), k_shot(5), distance_metric('euclidean')
+    PrototypicalNet   : n_way(5), k_shot(5), distance_metric('euclidean'), temperature(10.0)
     GATRelationalLayer: embed_dim(640), n_heads(4), dropout_rate(0.1),
                         attention_dropout(0.1), k_neighbours(5)
     GNNBackbone       : embed_dim(640), n_layers(3), dropout_rate(0.1),
@@ -149,9 +145,6 @@ Notes — Design Decisions & Status
 
 [DONE] TuneConfig.proxy_epochs — overrides hardcoded max(10,...) in tuner.
 
-[PENDING] ComponentModel._apply_hp() — re-applies HP after set_hp().
-          Currently no-op in most subclasses.
-
 [PENDING] ModelFactory.load() — add device consistency check.
 
 [FUTURE] ModelConfig.from_hydra(cfg) — when Hydra integrated.
@@ -200,9 +193,9 @@ class ComponentModel(nn.Module, ABC):
         Geometric   : GATRelationalLayer, GNNBackbone — graph neural
 
     HP Configuration (3 levels):
-        Level 1 — DEFAULT_HP class dict  : hardcoded class defaults
-        Level 2 — __init__ **kwargs      : from ModelConfig dict/yaml
-        Level 3 — set_hp(**kwargs)       : from Optuna tuner at trial time
+        Level 1 — DEFAULT_HP class dict   : hardcoded class defaults
+        Level 2 — __init__ **kwargs       : from ModelConfig dict/yaml
+        Level 3 — update_config(**kwargs) : from Optuna tuner at trial time
 
     Subclasses must implement:
         output_dim : int property — output feature dimensionality
@@ -237,25 +230,6 @@ class ComponentModel(nn.Module, ABC):
         """
         return self._hp.copy()
 
-    def set_hp(self, **kwargs):
-        """
-        Override HP values at runtime. Called by Optuna tuner at trial time.
-        Calls _apply_hp() after update to propagate to internal layers.
-        """
-        self._hp.update(kwargs)
-        self._apply_hp()
-
-    def _apply_hp(self):
-        """
-        Re-applies HP values to internal layers after set_hp().
-        Default: no-op. Override in subclass for runtime HP change support.
-
-        [PENDING] Implement where needed:
-            Conv4, ResNet12    : update self._dropout.p
-            Linear             : update self._dropout.p
-            GATRelationalLayer : update dropout rates
-        """
-        pass
 
     # ------------------------------------------------------------------
     # Freeze control
@@ -327,7 +301,6 @@ class SubChain(ComponentModel):
 
     Individual member control (if needed — prefer alias naming instead):
         chain.freeze_member(0)
-        chain.set_hp(index=1, dropout_rate=0.2)
     """
 
     def __init__(self, components: List[ComponentModel], **kwargs):
@@ -385,18 +358,6 @@ class SubChain(ComponentModel):
         if index is not None:
             return self._chain[index].get_hp()
         return {i: c.get_hp() for i, c in enumerate(self._chain)}
-
-    def set_hp(self, index: int = None, **kwargs):
-        """
-        Set HP on member(s).
-        index=None → applies to ALL members.
-        index=N    → applies to member N only.
-        """
-        if index is not None:
-            self._chain[index].set_hp(**kwargs)
-        else:
-            for comp in self._chain:
-                comp.set_hp(**kwargs)
 
     def param_count(self) -> int:
         return sum(c.param_count() for c in self._chain)
@@ -685,11 +646,6 @@ class Conv4(ComponentModel):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._dropout(self._backbone(x))
 
-    def _apply_hp(self):
-        """Update dropout wrapper after set_hp(dropout_rate=x)."""
-        rate          = self._hp.get('dropout_rate', 0.0)
-        self._dropout = nn.Dropout(rate) if rate > 0 else nn.Identity()
-
 
 # ------------------------------------------------------------------
 # ResNet12 — primary few-shot backbone via easyfsl
@@ -742,11 +698,6 @@ class ResNet12(ComponentModel):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._dropout(self._backbone(x))
 
-    def _apply_hp(self):
-        """Update dropout wrapper after set_hp(dropout_rate=x)."""
-        rate          = self._hp.get('dropout_rate', 0.0)
-        self._dropout = nn.Dropout(rate) if rate > 0 else nn.Identity()
-
 
 # ------------------------------------------------------------------
 # Linear — thin wrapper over nn.Linear, needed for classifier
@@ -793,11 +744,6 @@ class Linear(ComponentModel):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(self._dropout(x))   # always raw logits
-
-    def _apply_hp(self):
-        """Update dropout wrapper after set_hp(dropout_rate=x)."""
-        rate          = self._hp.get('dropout_rate', 0.0)
-        self._dropout = nn.Dropout(rate) if rate > 0 else nn.Identity()
 
 
 # ------------------------------------------------------------------
@@ -884,6 +830,7 @@ class PrototypicalNet(ComponentModel):
         n_way           (int, 5)           : classes per episode
         k_shot          (int, 5)           : support samples per class
         distance_metric (str, 'euclidean') : 'euclidean'
+        temperature     (float, 10.0)      : scaling factor for logits (optional)
 
     Input:
         support_emb : [N*K, D]  — pre-computed via mode='embedding'
@@ -893,18 +840,23 @@ class PrototypicalNet(ComponentModel):
     """
 
     DEFAULT_HP: Dict[str, Any] = {
-        'n_way':           5,
-        'k_shot':          5,
+        'n_way'          : 5,
+        'k_shot'         : 5,
         'distance_metric': 'euclidean',
+        'temperature'    : 10.0,   # initial value — learnable, optimizer updates during training
     }
 
-    def __init__(self, n_way: int = 5, k_shot: int = 5, distance_metric: str = 'euclidean', **kwargs):
-        super().__init__(n_way=n_way, k_shot=k_shot, distance_metric=distance_metric, **kwargs)
+    def __init__(self, n_way: int = 5, k_shot: int = 5, distance_metric: str = 'euclidean', temperature: float = 10.0, **kwargs):
+        super().__init__(n_way=n_way, k_shot=k_shot, distance_metric=distance_metric, temperature=temperature, **kwargs)
         self.n_way           = n_way
         self.k_shot          = k_shot
         self.distance_metric = distance_metric
         # Anchor so .to(device) propagates correctly
         self._anchor         = nn.Parameter(torch.zeros(1), requires_grad=False)
+        # Learnable temperature scale — restores logit magnitude after L2 normalisation.
+        # L2 norm bounds distances to [0,2]; temperature expands back to useful range.
+        # Follows TADAM (Oreshkin et al. 2018). Initial value from DEFAULT_HP.
+        self.temperature = nn.Parameter(torch.tensor(float(self._hp['temperature'])))
 
     @property
     def output_dim(self) -> int:
@@ -922,18 +874,18 @@ class PrototypicalNet(ComponentModel):
             support_emb : [N*K, D]
             query_emb   : [N*Q, D]
         Returns:
-            logits      : [N*Q, N_way] — negative Euclidean distances
+            logits      : [N*Q, N_way] — negative scaled Euclidean distances
         """
 
         # ── L2 normalise embeddings to unit hypersphere ───────────────
         # Prevents magnitude differences from dominating distance computation.
         # All embeddings projected to unit sphere — distances reflect
-        # angular separation only. Laenen et al. (2021) show this is one
-        # of the most impactful simple improvements for prototypical networks.
+        # angular separation only.
+        # Laenen et al. (2021) show this is one of the most impactful simple improvements for prototypical networks.
         support_emb = F.normalize(support_emb, p=2, dim=-1)   # [N*K, D]
         query_emb   = F.normalize(query_emb,   p=2, dim=-1)   # [N*Q, D]
 
-        D  = support_emb.shape[-1]
+        D = support_emb.shape[-1]
 
         # [N*K, D] → [N, K, D] → mean → [N, D]
         prototypes = (support_emb
@@ -941,8 +893,10 @@ class PrototypicalNet(ComponentModel):
                       .mean(dim=1))                          # [N, D]
 
         if self.distance_metric == 'euclidean':
-            dists = torch.cdist(query_emb, prototypes, p=2)
-            return -dists   # [N*Q, N]
+            dists = torch.cdist(query_emb, prototypes, p=2)   # [N*Q, N]
+            # Temperature scaling — restores logit magnitude after L2 normalisation.
+            # L2 norm bounds distances to [0,2]; temperature expands to useful range.
+            return -dists * self.temperature                   # [N*Q, N]
 
         else:
             raise ValueError(
@@ -1456,6 +1410,59 @@ class ModelConfig:
         """All component alias names."""
         return list(self._cfg['components'].keys())
 
+    @classmethod
+    def update_config(cls, config: 'ModelConfig', **hp_overrides) -> 'ModelConfig':
+        """
+        Return a new ModelConfig with hp_overrides applied on top of existing config.
+        Uses same aliased hp names as *_config() kwargs:
+            backbone_dropout, head_dropout, cnn_dropout, gat_dropout,
+            attention_dropout, n_way, k_shot, distance_metric, temperature,
+            n_layers, k_neighbours, n_heads
+
+        Use when model_config already exists and you need to override specific HPs
+        without rebuilding from scratch.
+
+        Example:
+            cfg = ModelConfig.cnn_config()
+            cfg = ModelConfig.update_config(cfg, backbone_dropout=0.1, temperature=15.0)
+            model = ModelFactory.create(cfg, device=device)
+        """
+        import copy as _copy
+        # Aliased name → (component_alias, field_name) — same as *_config() logic
+        ALIAS = {
+            'backbone_dropout'  : ('backbone',     'dropout_rate'),
+            'head_dropout'      : ('linear',       'dropout_rate'),
+            'cnn_dropout'       : ('backbone',     'dropout_rate'),
+            'gat_dropout'       : ('backbone',     'dropout_rate'),
+            'attention_dropout' : ('backbone',     'attention_dropout'),
+            'temperature'       : ('prototypical', 'temperature'),
+            'n_way'             : ('prototypical', 'n_way'),
+            'k_shot'            : ('prototypical', 'k_shot'),
+            'distance_metric'   : ('prototypical', 'distance_metric'),
+            'n_layers'          : ('backbone',     'n_layers'),
+            'k_neighbours'      : ('backbone',     'k_neighbours'),
+            'n_heads'           : ('backbone',     'n_heads'),
+        }
+        cfg = _copy.deepcopy(config.to_dict())
+        for alias, val in hp_overrides.items():
+            if alias not in ALIAS:
+                import warnings
+                warnings.warn(f"ModelConfig.update_config: unknown alias '{alias}' — ignored")
+                continue
+            comp_alias, field = ALIAS[alias]
+            comp = cfg['components'].get(comp_alias)
+            if comp is None:
+                continue
+            if isinstance(comp, list):
+                for member in comp:
+                    if field in member:
+                        member[field] = val
+                        break
+            else:
+                if field in comp:
+                    comp[field] = val
+        return cls.from_dict(cfg)
+
     def components_by_role(self, role: str) -> List[str]:
         """Component aliases with given role."""
         result = []
@@ -1539,6 +1546,7 @@ class ModelConfig:
                     'n_way':           hp_overrides.pop('n_way',            5),
                     'k_shot':          hp_overrides.pop('k_shot',           5),
                     'distance_metric': hp_overrides.pop('distance_metric', 'euclidean'),
+                    'temperature':     hp_overrides.pop('temperature',      10.0),
                 },
             },
             'graph': [
@@ -1583,8 +1591,9 @@ class ModelConfig:
                 'softmax': {'name': 'softmax', 'role': 'head'},
                 'prototypical': {
                     'name': 'prototypical', 'role': 'head',
-                    'n_way':  hp_overrides.pop('n_way',  5),
-                    'k_shot': hp_overrides.pop('k_shot', 5),
+                    'n_way':       hp_overrides.pop('n_way',        5),
+                    'k_shot':      hp_overrides.pop('k_shot',       5),
+                    'temperature': hp_overrides.pop('temperature',  10.0),
                 },
             },
             'graph': [
@@ -1638,8 +1647,9 @@ class ModelConfig:
                 'softmax': {'name': 'softmax', 'role': 'head'},
                 'prototypical': {
                     'name': 'prototypical', 'role': 'head',
-                    'n_way':  hp_overrides.pop('n_way',  5),
-                    'k_shot': hp_overrides.pop('k_shot', 5),
+                    'n_way':       hp_overrides.pop('n_way',        5),
+                    'k_shot':      hp_overrides.pop('k_shot',       5),
+                    'temperature': hp_overrides.pop('temperature',  10.0),
                 },
             },
             'graph': [
@@ -1682,8 +1692,6 @@ class CompositeModel(nn.Module):
 
     HP access per component:
         model.get_component('backbone').get_hp()
-        model.get_component('backbone').set_hp(dropout_rate=0.2)
-        # SubChain member: model.get_component('backbone').set_hp(index=0, dropout_rate=0.2)
 
     Forward modes:
         outputs dict defines available modes
