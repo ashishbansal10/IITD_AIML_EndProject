@@ -864,7 +864,7 @@ class PrototypicalNet(ComponentModel):
 
     @property
     def is_mathematical(self) -> bool:
-        return True
+        return False
 
     def forward(self,
                 support_emb: torch.Tensor,

@@ -355,8 +355,7 @@ class HPTuner:
 
         if self.load_checkpoint_path:
             # ── Train-phase tuning — reload pretrain checkpoint ───────
-            state_dict = torch.load(self.load_checkpoint_path, map_location=self.device)
-            trial_model.load_state_dict(state_dict)
+            ModelFactory.load(trial_model, self.load_checkpoint_path)
             self._logger.info(f"Trial {trial.number} | loaded pretrain ckpt: {self.load_checkpoint_path}")
         else:
             # ── Pretrain-phase tuning — shorten epochs for proxy ──────

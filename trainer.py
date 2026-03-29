@@ -454,7 +454,11 @@ class TrainerImpl:
         self.state.epoch = 0
 
         print(f"\n  Phase 1: Pretrain [pytorch | {self.config.epochs_pretrain} epochs]")
+        self.model.freeze('prototypical')
+
         self._pretrain_pytorch()
+
+        self.model.unfreeze('prototypical')
 
         # Restore best-pretrain-epoch weights before returning.
         # Caller (runner) receives model already at best state — no load_best() needed.
@@ -471,11 +475,15 @@ class TrainerImpl:
 
         print(f"\n  Phase 2: Train [standard | pytorch | {self.config.epochs_train} epochs]")
 
+        self.model.freeze('prototypical')
+
         self._run_train_pytorch(
             train_pool = 'train',
             val_pool   = val_pool,
             episodic   = False
         )
+
+        self.model.unfreeze('prototypical')
 
         # Restore best-train-epoch weights before returning.
         self._load_train_best()
