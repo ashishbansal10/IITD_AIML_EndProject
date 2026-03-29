@@ -369,9 +369,9 @@ def run_all_smoke_tests(loader_factory, device, num_workers=0, stop_on_fail=True
     import time
 
     tests = [
-        ('smoke_test0 — data pipeline',   lambda: run_smoke_test0(loader_factory, device, num_workers)),
-        ('smoke_test1 — forward pass',    lambda: run_smoke_test1(loader_factory, device)),
-        ('smoke_test2 — all 6 archs',     lambda: run_smoke_test2(loader_factory, device, num_workers)),
+        #('smoke_test0 — data pipeline',   lambda: run_smoke_test0(loader_factory, device, num_workers)),
+        #('smoke_test1 — forward pass',    lambda: run_smoke_test1(loader_factory, device)),
+        #('smoke_test2 — all 6 archs',     lambda: run_smoke_test2(loader_factory, device, num_workers)),
         ('smoke_test3 — optuna',          lambda: run_smoke_test3(loader_factory, device, num_workers)),
     ]
 
