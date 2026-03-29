@@ -569,8 +569,8 @@ class ExperimentRunner:
             device               = self.device,
             run_id               = run_cfg.run_id,
             paradigm             = run_cfg.paradigm,
-            logs_dir             = self.exec_config.logs_dir,
             phase                = phase,
+            logs_dir             = self.exec_config.logs_dir,
             load_checkpoint_path = ckpt_path,
         )
         return tuner.run()

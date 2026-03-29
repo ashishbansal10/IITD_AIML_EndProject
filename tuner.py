@@ -189,6 +189,7 @@ class HPTuner:
                  device:               torch.device,
                  run_id:               str           = 'run',
                  paradigm:             str           = 'standard',
+                 phase:                str           = 'pretrain',
                  logs_dir:             str           = 'logs',
                  load_checkpoint_path: Optional[str] = None):
         """
@@ -200,6 +201,7 @@ class HPTuner:
             device                : torch.device
             run_id                : str — run identifier for log filename
             paradigm              : 'standard' or 'fewshot' — selects trainer class
+            phase                 : 'pretrain' or 'train' — selects tuning phase
             logs_dir              : str — directory for detailed log files
             load_checkpoint_path  : str or None
                                     None  = pretrain-phase tuning (runs proxy pretrain)
@@ -212,6 +214,7 @@ class HPTuner:
         self.device               = device
         self.run_id               = run_id
         self.paradigm             = paradigm
+        self.phase                = phase
         self.load_checkpoint_path = load_checkpoint_path
 
         # Best HPs found — populated after run()
@@ -221,10 +224,9 @@ class HPTuner:
         # ── Logger — detailed output to file, minimal to stdout ───────
 
         os.makedirs(logs_dir, exist_ok=True)
-        phase = 'train' if load_checkpoint_path else 'pretrain'
-        log_path = os.path.join(logs_dir, f"{run_id}_tuner_{phase}.log")
+        log_path = os.path.join(logs_dir, f"{run_id}_tuner_{self.phase}.log")
 
-        self._logger = logging.getLogger(f"tuner.{run_id}.{phase}")
+        self._logger = logging.getLogger(f"tuner.{run_id}.{self.phase}")
         self._logger.setLevel(logging.DEBUG)
         self._logger.handlers.clear()
 
@@ -286,9 +288,8 @@ class HPTuner:
             load_if_exists = True       # resume if storage set + study exists
         )
 
-        phase = 'train' if self.load_checkpoint_path else 'pretrain'
-        print(f"  Tuner started [{self.run_id} | {phase} | {n_trials} trials | space={self.tune_config.search_space_size()}]")
-        self._logger.info(f"Tuner started — run_id={self.run_id} phase={phase} n_trials={n_trials}")
+        print(f"  Tuner started [{self.run_id} | {self.phase} | {n_trials} trials | space={self.tune_config.search_space_size()}]")
+        self._logger.info(f"Tuner started — run_id={self.run_id} phase={self.phase} n_trials={n_trials}")
         self._logger.info(f"Search space model: {self.tune_config.model_hp_choices}")
         self._logger.info(f"Search space train: {self.tune_config.train_hp_choices}")
         self._logger.info(f"Objective: {'train val_loss (reusing pretrain ckpt)' if self.load_checkpoint_path else 'pretrain val_loss (proxy)'}")
