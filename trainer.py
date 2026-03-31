@@ -5,26 +5,17 @@ Training pipeline for Few-Shot Learning — Standard and FewShot paradigms.
 
 Classes
 -------
-TrainConfig             — all training HPs + backend switches
-TrainingState           — mutable training state (separated for Optuna access)
-TrainingHistory         — immutable per-epoch metrics log
-LightningModuleWrapper  — Lightning module for pretrain phase
-                          pretrain always uses Lightning
-TrainerImpl             — all actual training logic
-StandardTrainer         — thin wrapper → batch training
-FewShotTrainer          — thin wrapper → episodic training
-
-Backend
--------
-Pretrain phase  : always Lightning (backend_pretrain='lightning')
-                  EarlyStopping, ModelCheckpoint, mixed precision built in
-Train phase     : PyTorch by default (backend_train='pytorch')
-                  backend_train='lightning' — [FUTURE]
+TrainConfig     — all training HPs and configuration
+TrainingState   — mutable training state (separated for Optuna access)
+TrainingHistory — immutable per-epoch metrics log
+TrainerImpl     — all actual training logic
+StandardTrainer — thin wrapper → batch training
+FewShotTrainer  — thin wrapper → episodic training
 
 Training Flow
 -------------
 Phase 1 — Pretrain (both paradigms, identical):
-    pool='pretrain', mode='batch', Lightning
+    pool='pretrain', mode='batch', PyTorch
     loss = F.cross_entropy(model(imgs, mode='linear'), labels)
     val  = 'val_seen', mode='batch'
 
@@ -55,7 +46,7 @@ Required Libraries
 # torch>=2.0.0
 # tqdm>=4.0.0               # train phase — pip install tqdm
 
-[FUTURE WORK] Elastic Weight Consolidation (EWC)
+Elastic Weight Consolidation (EWC)
 
 The primary experimental finding of this study is that the train phase 
 consistently degrades novel class generalisation across all 6 runs — 
@@ -162,6 +153,12 @@ class TrainConfig:
     # e.g. {'backbone': 1e-4, 'linear': 1e-3}
     lr_map:               Optional[Dict[str, float]] = None
 
+    # ── Train phase improvements (all default to disabled = current behaviour) ──
+    ewc_lambda:       float = 0.0    # EWC penalty weight — 0.0 = disabled
+    freeze_n_epochs:  int   = 0      # freeze backbone first N train epochs — 0 = disabled
+    joint_loss_alpha: float = 0.0    # KL embedding anchor weight — 0.0 = disabled
+    warm_start:       bool  = False  # init train early-stop from pretrain best — False = reset
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -263,8 +260,17 @@ class TrainingState:
     is_pretrained:        bool  = False
     is_trained:           bool  = False
 
+    # Runtime tensors — populated during training, excluded from JSON serialization
+    pretrain_emb_mean:    Any   = field(default=None, repr=False)  # [D] — KL joint loss reference
+    pretrain_emb_var:     Any   = field(default=None, repr=False)  # [D] — KL joint loss reference
+    fisher_diag:          Any   = field(default=None, repr=False)  # dict{name: tensor} — EWC Fisher
+    pretrain_weights:     Any   = field(default=None, repr=False)  # dict{name: tensor} — EWC reference
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        for key in ('pretrain_emb_mean', 'pretrain_emb_var', 'fisher_diag', 'pretrain_weights'):
+            d.pop(key, None)  # remove tensors from dict for JSON serialization
+        return d
 
     def reset_early_stop(self):
         self.early_stop_counter   = 0
@@ -465,6 +471,14 @@ class TrainerImpl:
         self._load_pretrain_best()
         self.state.is_pretrained = True
 
+        # Compute reference stats for train phase improvements (only if enabled)
+        if self.config.joint_loss_alpha > 0:
+            mean, var = self._compute_emb_stats()
+            self.state.pretrain_emb_mean = mean
+            self.state.pretrain_emb_var  = var
+        if self.config.ewc_lambda > 0:
+            self._compute_fisher()
+
     def train_batch(self, val_pool: str = 'val_seen'):
         """
         Phase 2a — standard batch training.
@@ -472,6 +486,10 @@ class TrainerImpl:
         """
         self.state.reset_early_stop()
         self.state.epoch = 0
+
+        if self.config.warm_start:
+            self.state.best_val_loss = self.state.pretrain_best_val_loss
+            self.state.best_val_acc  = self.state.pretrain_best_val_acc
 
         print(f"\n  Phase 2: Train [standard | pytorch | {self.config.epochs_train} epochs]")
 
@@ -498,6 +516,10 @@ class TrainerImpl:
         """
         self.state.reset_early_stop()
         self.state.epoch = 0
+
+        if self.config.warm_start:
+            self.state.best_val_loss = self.state.pretrain_best_val_loss
+            self.state.best_val_acc  = self.state.pretrain_best_val_acc
 
         print(f"\n  Phase 2: Train [fewshot | pytorch | {self.config.episodes_train} eps/epoch | {self.config.epochs_train} epochs]")
 
@@ -634,6 +656,14 @@ class TrainerImpl:
             self.state.epoch = epoch
             epochs_run = epoch + 1
 
+            # freeze_n_epochs: freeze backbone for first N epochs, unfreeze after
+            # mutual exclusion with EWC — if EWC active, freeze_n ignored
+            if self.config.ewc_lambda == 0 and self.config.freeze_n_epochs > 0:
+                if epoch == 0:
+                    self.model.freeze('backbone')
+                elif epoch == self.config.freeze_n_epochs:
+                    self.model.unfreeze('backbone')
+
             if episodic:
                 # Set epoch for EpisodicBatchSampler RNG variation
                 if hasattr(train_loader.batch_sampler, 'set_epoch'):
@@ -666,6 +696,10 @@ class TrainerImpl:
                 if self.config.verbose:
                     print(f"  Early stopping at epoch {epoch}")
                 break
+
+        # Ensure backbone unfrozen after train loop (in case freeze_n >= epochs_train)
+        if self.config.ewc_lambda == 0 and self.config.freeze_n_epochs > 0:
+            self.model.unfreeze('backbone')
 
         elapsed = (time.time() - self._phase_start_time) / 60
         print(f"  Train  — ran {epochs_run}/{self.config.epochs_train} epochs  "
@@ -707,6 +741,11 @@ class TrainerImpl:
                 loss = self._criterion(logits, labels)
 
                 if is_train:
+                    if self.config.ewc_lambda > 0:
+                        loss = loss + self.config.ewc_lambda * self._ewc_penalty()
+                    if self.config.joint_loss_alpha > 0:
+                        emb  = self.model(imgs, mode='embedding')
+                        loss = loss + self.config.joint_loss_alpha * self._compute_kl_loss(emb)
                     optimizer.zero_grad()
                     loss.backward()
                     if self.config.grad_clip is not None:
@@ -773,6 +812,11 @@ class TrainerImpl:
                 loss = self._criterion(dists, target)
 
                 if is_train:
+                    if self.config.ewc_lambda > 0:
+                        loss = loss + self.config.ewc_lambda * self._ewc_penalty()
+                    if self.config.joint_loss_alpha > 0:
+                        # all_emb already computed above — reuse for KL anchor
+                        loss = loss + self.config.joint_loss_alpha * self._compute_kl_loss(all_emb)
                     optimizer.zero_grad()
                     loss.backward()
                     if self.config.grad_clip is not None:
@@ -857,6 +901,99 @@ class TrainerImpl:
         """Internal — save full model during training loop on improvement."""
         from model_factory import ModelFactory
         ModelFactory.save(self.model, path)
+
+    # ------------------------------------------------------------------
+    # Train phase improvement helpers
+    # ------------------------------------------------------------------
+
+    def _compute_emb_stats(self):
+        """
+        Forward pass over val_seen — compute backbone embedding mean and var.
+        Called once at end of pretrain() when joint_loss_alpha > 0.
+        Returns (mean [D], var [D]) as detached CPU tensors.
+        """
+        loader = self.factory.get_loader(
+            'val_seen', mode='batch',
+            batch_size  = self.config.batch_size,
+            num_workers = self.config.num_workers
+        )
+        self.model.eval()
+        all_embs = []
+        with torch.no_grad():
+            for imgs, _ in loader:
+                imgs = imgs.to(self.device)
+                emb  = self.model(imgs, mode='embedding')
+                all_embs.append(emb.cpu())
+        all_embs = torch.cat(all_embs, dim=0)   # [N, D]
+        return all_embs.mean(0).to(self.device), all_embs.var(0).to(self.device)
+
+    def _compute_fisher(self):
+        """
+        Compute diagonal Fisher information matrix over pretrain val_seen.
+        Called once at end of pretrain() when ewc_lambda > 0.
+        Stores fisher_diag and pretrain_weights in self.state.
+        """
+        loader = self.factory.get_loader(
+            'val_seen', mode='batch',
+            batch_size  = self.config.batch_size,
+            num_workers = self.config.num_workers
+        )
+        self.model.eval()
+        fisher = {n: torch.zeros_like(p) for n, p in self.model.named_parameters()
+                  if p.requires_grad}
+        n_batches = 0
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(self.device), labels.to(self.device)
+            self.model.zero_grad()
+            logits = self.model(imgs, mode='linear')
+            loss   = torch.nn.functional.cross_entropy(logits, labels)
+            loss.backward()
+            for n, p in self.model.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    fisher[n] += p.grad.detach() ** 2
+            n_batches += 1
+        for n in fisher:
+            fisher[n] /= max(n_batches, 1)
+        self.state.fisher_diag     = fisher
+        self.state.pretrain_weights = {n: p.detach().clone()
+                                       for n, p in self.model.named_parameters()
+                                       if p.requires_grad}
+
+    def _ewc_penalty(self) -> torch.Tensor:
+        """EWC regularisation penalty — sum of Fisher-weighted squared weight drift."""
+        penalty = torch.tensor(0.0, device=self.device)
+        if self.state.fisher_diag is None:
+            return penalty
+        for n, p in self.model.named_parameters():
+            if n in self.state.fisher_diag:
+                penalty = penalty + (
+                    self.state.fisher_diag[n] *
+                    (p - self.state.pretrain_weights[n]) ** 2
+                ).sum()
+        return penalty
+
+    def _compute_kl_loss(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        KL divergence between current batch embedding distribution and
+        pretrain reference distribution (stored in state after pretrain).
+        Closed-form KL between diagonal Gaussians:
+            KL(N(mu1,var1) || N(mu2,var2))
+        Returns scalar — 0 if reference stats not available.
+        """
+        if self.state.pretrain_emb_mean is None:
+            return torch.tensor(0.0, device=self.device)
+        mu1  = embeddings.mean(0)
+        var1 = embeddings.var(0).clamp(min=1e-8)
+        mu2  = self.state.pretrain_emb_mean
+        var2 = self.state.pretrain_emb_var.clamp(min=1e-8)
+        D    = mu1.shape[0]
+        kl   = 0.5 * (
+            (var1 / var2).sum() +
+            ((mu2 - mu1) ** 2 / var2).sum() -
+            D +
+            (var2.log().sum() - var1.log().sum())
+        )
+        return kl
 
     def _load_pretrain_best(self):
         """

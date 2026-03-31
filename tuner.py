@@ -1,47 +1,48 @@
 """
 tuner.py
 ========
-Hyperparameter tuning via Optuna — learning objective implementation.
+Hyperparameter tuning via Optuna.
 
-Purpose
+Classes
 -------
-Demonstrates Optuna integration with the training pipeline.
-Not a full HP search — 2 HPs × 2 values = 4 trials total.
-Designed to show how Optuna connects to model, trainer, and experiment.
+TuneConfig — search space + trial control
+HPTuner    — Optuna study wrapper, runs trials, returns best HPs
 
-Tuned HPs
----------
-Model HP    : backbone dropout_rate → [0.0, 0.2]
-              0.0 = no dropout (baseline)
-              0.2 = with dropout (regularized)
+Search Space
+------------
+model_hp_choices : List[Dict[str, List]] — HPs applied to ModelConfig
+                   e.g. [{'backbone_dropout': [0.0, 0.1, 0.2]}]
+                   Applied via ModelConfig.update_config(**model_sampled)
 
-Training HP : lr → [1e-4, 1e-3]
-              1e-4 = low lr (slower, more stable)
-              1e-3 = standard lr (faster convergence)
+train_hp_choices : List[Dict[str, List]] — HPs applied to TrainConfig
+                   e.g. [{'label_smoothing': [0.0, 0.05, 0.1],
+                           'weight_decay'  : [1e-4, 5e-4]}]
+                   Applied via setattr(train_config, k, v)
 
-Total trials: 2 × 2 = 4 (full grid)
+Both accept a list of sub-space dicts. Each sub-space is fully cross-producted.
+Multiple sub-spaces allow defining mutually exclusive HP combinations:
+    e.g. Group B — EWC vs freeze_n (mutually exclusive):
+    train_hp_choices = [
+        {'ewc_lambda': [0.0],            'freeze_n_epochs': [0]},
+        {'ewc_lambda': [0.0],            'freeze_n_epochs': [5, 10, 20]},
+        {'ewc_lambda': [0.1, 1.0, 10.0], 'freeze_n_epochs': [0]},
+    ]
+    Total trials = 1 + 3 + 3 = 7  (no wasted combinations)
 
-Objective
----------
-Proxy: pretrain phase only — val_loss after pretrain.
-Full train too expensive per trial.
-Assumption: backbone that pretrains well generalizes well.
-Best HPs from pretrain used for full training in ExperimentRunner.
+Sampler auto-selected:
+    total_space_size <= 12 → GridSampler (exhaustive, guaranteed coverage)
+    total_space_size >  12 → TPESampler  (Bayesian, learns from trials)
 
-LR and Scheduler
-----------------
-Optuna picks starting lr before training.
-Scheduler (step/cosine) decays from that starting lr during training.
-No conflict — they operate at different levels:
-    Optuna  : picks lr = 1e-3
-    Scheduler: 1e-3 → 5e-4 → 2.5e-4 (step decay each N epochs)
+Pruner auto-selected from effective n_trials:
+    <= 10 → NopPruner
+    <= 30 → MedianPruner
+    >  30 → HyperbandPruner
 
-Framework Integration Notes
-----------------------------
-[CONFIRMED] Optuna integrated here for learning purposes.
-[CONFIRMED] hydra  — cut, stub in ModelConfig.from_yaml()
-[CONFIRMED] torch.fx — cut, stub in CompositeModel._execute_graph()
-[CONFIRMED] Optuna — tuner.py, 4-trial grid
+Tuning Phases
+-------------
+phase='pretrain' : proxy pretrain per trial → val_loss objective
+phase='train'    : reloads pretrain checkpoint per trial → val_loss objective
+phase='full'     : full pretrain + train per trial → val_loss objective
 
 Required Libraries
 ------------------
@@ -65,68 +66,79 @@ class TuneConfig:
     """
     Hyperparameter tuning configuration.
 
-    User sets hp_choices and optionally model_hp_keys.
-    Sampler, pruner, n_trials are auto-selected internally.
+    Sampler, pruner, n_trials are auto-selected internally — user sets search space only.
 
-    hp_choices — {hp_name: [choice1, choice2, ...]}
-        Pretrain: {'dropout_rate': [0.0, 0.1, 0.2], 'lr': [1e-4, 5e-4, 1e-3]}
-        Train:    {'temperature': [5.0, 10.0, 20.0],
-                   'label_smoothing': [0.0, 0.05, 0.1],
-                   'weight_decay': [1e-4, 5e-4]}
+    model_hp_choices : List[Dict[str, List]]
+        HPs that go to ModelConfig — aliased names matching *_config() kwargs.
+        e.g. [{'backbone_dropout': [0.0, 0.1, 0.2]}]
+        Applied via ModelConfig.update_config(**model_sampled).
+        Only active in pretrain-phase tuning — model is fixed in train-phase tuning.
 
-    model_hp_keys — hp names going to model components (not TrainConfig):
-        'dropout_rate' → backbone.set_hp(dropout_rate=v)
-        'temperature'  → prototypical head set_hp(temperature=v)
-        All others     → setattr(train_config, key, value)
+    train_hp_choices : List[Dict[str, List]]
+        HPs that go to TrainConfig — field names directly.
+        e.g. [{'label_smoothing': [0.0, 0.05, 0.1], 'weight_decay': [1e-4, 5e-4]}]
+        Applied via setattr(train_config, k, v).
 
-    Sampler auto-selected:
-        search_space_size <= 12 → GridSampler  (exhaustive)
-        search_space_size >  12 → TPESampler   (Bayesian)
+    Both accept a list of sub-space dicts:
+        Single sub-space  → full cross-product (standard grid)
+        Multiple sub-spaces → each sub-space cross-producted independently,
+                              total trials = sum of sub-space sizes.
+                              Use to define mutually exclusive HP combinations.
+
+    Sampler auto-selected from total_space_size:
+        <= 12 → GridSampler (exhaustive, guaranteed coverage)
+        >  12 → TPESampler  (Bayesian, learns from trials)
 
     Pruner auto-selected from effective n_trials:
         <= 10 → NopPruner
         <= 30 → MedianPruner
         >  30 → HyperbandPruner
 
-    n_trials auto-selected:
-        GridSampler → product of all choice lengths
-        TPESampler  → min(search_space_size * 2, 30) unless overridden
+    n_trials: None = auto 
+        GridSampler → : total space size
+        TPESampler  → : max(10: min(size*2, 30))
+        unless overridden by user.
 
-    proxy_epochs — short pretrain proxy for pretrain-phase tuning.
-        None = max(10, epochs_pretrain // 5)
-        Ignored for train-phase tuning (checkpoint reloaded instead).
-
-    [FUTURE] Extend search space here when more HPs needed.
-             Add float ranges: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
-             Add integers:     trial.suggest_int('n_layers', 2, 5)
+    proxy_epochs: None = max(10, epochs_pretrain // 5) — pretrain-phase tuning only
     """
 
     # ── Search space ──────────────────────────────────────────────────
     # model_hp_choices: aliased names matching *_config() hp_overrides kwargs
-    #   e.g. {'backbone_dropout': [0.0, 0.1, 0.2], 'temperature': [5.0, 10.0]}
-    #   Applied via ModelFactory.create(hp_overrides=model_sampled)
+    #   e.g. [{'backbone_dropout': [0.0, 0.1, 0.2], 'temperature': [5.0, 10.0]}]
+    #   Applied via :
+    #       model_config = ModelConfig.update_config(base_model_config, **model_sampled)
+    #       model = ModelFactory.create()
     #
     # train_hp_choices: TrainConfig field names
-    #   e.g. {'label_smoothing': [0.0, 0.05, 0.1], 'weight_decay': [1e-4, 5e-4]}
+    #   e.g. [{'label_smoothing': [0.0, 0.05, 0.1], 'weight_decay': [1e-4, 5e-4]}]
     #   Applied via setattr(train_config, k, v)
-    model_hp_choices: Dict[str, List[Any]] = field(default_factory=dict)
-    train_hp_choices: Dict[str, List[Any]] = field(default_factory=dict)
+    # Each is a list of sub-space dicts. Single-element list = standard grid.
+    # Multiple sub-spaces allow mutually exclusive HP combinations.
+    model_hp_choices: List[Dict[str, List[Any]]] = field(default_factory=list)
+    train_hp_choices: List[Dict[str, List[Any]]] = field(default_factory=list)
 
     # ── Optional ──────────────────────────────────────────────────────
     n_trials:     Optional[int] = None   # None = auto from search space
-    proxy_epochs: Optional[int] = None   # None = epochs_pretrain // 5
+    proxy_epochs: Optional[int] = None   # None = max(10, epochs_pretrain // 5)
     study_name:   str           = 'hp_search'
     storage:      Optional[str] = None   # None=memory, path=persistent
 
+    def _space_size(self, spaces: List[Dict[str, List[Any]]]) -> int:
+        """Sum of cross-products across all sub-spaces in a choices list."""
+        total = 0
+        for space in spaces:
+            size = 1
+            for v in space.values():
+                size *= len(v)
+            total += size
+        return total or 1
+
     def search_space_size(self) -> int:
-        """Product of all choice lengths across both model and train HPs."""
-        size = 1
-        for v in {**self.model_hp_choices, **self.train_hp_choices}.values():
-            size *= len(v)
-        return size
+        """Total trials = sum of all sub-space sizes across model + train choices."""
+        return self._space_size(self.model_hp_choices) + self._space_size(self.train_hp_choices) - (1 if self.model_hp_choices and self.train_hp_choices else 0)
 
     def effective_n_trials(self) -> int:
-        """Auto-compute n_trials if not set by user."""
+        """Auto-compute n_trials. GridSampler = exact size. TPE = heuristic."""
         if self.n_trials is not None:
             return self.n_trials
         size = self.search_space_size()
@@ -134,9 +146,12 @@ class TuneConfig:
             return size
         return min(size * 2, 30)
 
-    def all_hp_choices(self) -> Dict[str, List[Any]]:
-        """Combined dict for Optuna sampling — all HPs together."""
-        return {**self.model_hp_choices, **self.train_hp_choices}
+    def all_spaces(self) -> List[Dict[str, List[Any]]]:
+        """All sub-spaces combined — passed to GridSampler."""
+        if self.model_hp_choices and self.train_hp_choices:
+            # Merge each pair of sub-spaces for joint sampling
+            return self.model_hp_choices + self.train_hp_choices
+        return self.model_hp_choices or self.train_hp_choices
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -153,32 +168,26 @@ class TuneConfig:
 
 class HPTuner:
     """
-    Optuna wrapper — finds best dropout_rate and lr via 4-trial grid.
+    Optuna study wrapper — runs HP search, returns best HPs.
 
     Flow per trial:
-        1. Optuna samples dropout_rate from [0.0, 0.2]
-        2. Optuna samples lr           from [1e-4, 1e-3]
-        3. Apply dropout_rate to backbone via component.set_hp()
-        4. Apply lr to a fresh TrainConfig copy
-        5. Run pretrain phase only (proxy for full training)
-        6. Return best_val_loss as Optuna objective
-        7. Optuna picks best trial after n_trials
+        1. Optuna samples HPs from model_hp_choices + train_hp_choices sub-spaces
+        2. Apply model HPs → fresh ModelConfig via ModelConfig.update_config()
+        3. Apply train HPs → fresh TrainConfig copy via setattr
+        4. Run training phase (pretrain proxy / train / full per phase setting)
+        5. Return best_val_loss as Optuna objective
+        6. Optuna picks best trial after n_trials
 
     Usage:
         tuner    = HPTuner(model_config, train_config, tune_config,
-                           factory, device)
+                           factory, device, phase='train',
+                           load_checkpoint_path=ckpt_path)
         best_hps = tuner.run()
-        # best_hps = {'dropout_rate': 0.2, 'lr': 1e-3}
-
-        # Apply best HPs before full training
-        model.get_component('backbone').set_hp(
-            dropout_rate=best_hps['dropout_rate']
-        )
-        train_config.lr = best_hps['lr']
+        # best_hps = {'label_smoothing': 0.05, 'weight_decay': 5e-4}
 
     Note:
-        Each trial creates a fresh model copy — original model untouched.
-        After tuner.run() completes, caller applies best HPs to original model.
+        Each trial creates a fresh model — original model_config untouched.
+        ExperimentRunner applies best HPs after tuner.run() completes.
     """
 
     def __init__(self,
@@ -224,9 +233,13 @@ class HPTuner:
         # ── Logger — detailed output to file, minimal to stdout ───────
 
         os.makedirs(logs_dir, exist_ok=True)
-        log_path = os.path.join(logs_dir, f"{run_id}_tuner_{self.phase}.log")
-
-        self._logger = logging.getLogger(f"tuner.{run_id}.{self.phase}")
+        log_path = os.path.join(
+            logs_dir,
+            f"{run_id}_{tune_config.study_name}_{self.phase}.log"
+        )
+        self._logger = logging.getLogger(
+            f"tuner.{run_id}.{tune_config.study_name}.{self.phase}"
+        )
         self._logger.setLevel(logging.DEBUG)
         self._logger.handlers.clear()
 
@@ -248,12 +261,15 @@ class HPTuner:
             )
 
     def _select_sampler(self):
-        """Auto-select sampler based on combined search space size."""
-        size     = self.tune_config.search_space_size()
-        all_hps  = self.tune_config.all_hp_choices()
+        """Auto-select sampler based on total search space size.
+        GridSampler receives list of sub-space dicts — exhausts each sub-space fully.
+        TPESampler used for larger spaces — learns from trials.
+        """
+        size   = self.tune_config.search_space_size()
+        spaces = self.tune_config.all_spaces()
         if size <= 12:
             self._logger.info(f"Sampler: GridSampler (space_size={size})")
-            return self._optuna.samplers.GridSampler(all_hps)
+            return self._optuna.samplers.GridSampler(spaces)
         self._logger.info(f"Sampler: TPESampler (space_size={size})")
         return self._optuna.samplers.TPESampler()
 
@@ -292,6 +308,7 @@ class HPTuner:
         self._logger.info(f"Tuner started — run_id={self.run_id} phase={self.phase} n_trials={n_trials}")
         self._logger.info(f"Search space model: {self.tune_config.model_hp_choices}")
         self._logger.info(f"Search space train: {self.tune_config.train_hp_choices}")
+        self._logger.info(f"Total space size: {self.tune_config.search_space_size()} | n_trials: {n_trials}")
         self._logger.info(f"Objective: {'train val_loss (reusing pretrain ckpt)' if self.load_checkpoint_path else 'pretrain val_loss (proxy)'}")
 
         study.optimize(
@@ -323,17 +340,20 @@ class HPTuner:
         import gc
 
         # ── Sample train HPs always ───────────────────────────────────
+        # train_hp_choices is List[Dict[str, List]] — flatten all sub-spaces
         train_sampled = {}
-        for hp_name, choices in self.tune_config.train_hp_choices.items():
-            train_sampled[hp_name] = trial.suggest_categorical(hp_name, choices)
+        for space in self.tune_config.train_hp_choices:
+            for hp_name, choices in space.items():
+                train_sampled[hp_name] = trial.suggest_categorical(hp_name, choices)
 
         # ── Sample model HPs only in pretrain-phase tuning ────────────
         # When load_checkpoint_path set (train-phase tuning), model is fixed —
         # model HPs cannot meaningfully change loaded weights.
         model_sampled = {}
         if not self.load_checkpoint_path:
-            for hp_name, choices in self.tune_config.model_hp_choices.items():
-                model_sampled[hp_name] = trial.suggest_categorical(hp_name, choices)
+            for space in self.tune_config.model_hp_choices:
+                for hp_name, choices in space.items():
+                    model_sampled[hp_name] = trial.suggest_categorical(hp_name, choices)
 
         self._logger.info(f"Trial {trial.number} | model_hps={model_sampled} train_hps={train_sampled}")
 

@@ -26,12 +26,6 @@ Per-Run Flow in ExperimentRunner
     eval_trained()
     collect RunScores → RunResult → save JSON → _cleanup()
 
-Eval Immediately After Each Phase
-----------------------------------
-Trainer internally loads best-epoch weights before pretrain()/train() return.
-Model is already at best state when control returns to runner — no load_best() needed.
-Export paths (if saved) are read from trainer.state.pretrain_export_path / final_export_path.
-
 Tuning Modes (ExperimentConfig fields)
 ---------------------------------------
     Scenario 1 — pretrain_tune_config only:
@@ -185,6 +179,7 @@ class ExecutionerConfig:
     # Decided at end of each run — not mid-run
     keep_pretrain_checkpoint: bool = False
     keep_train_checkpoint:    bool = True
+    save_tune_logs:           bool = True   # False = delete tuner log files after tune_all()
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -303,9 +298,9 @@ class ExperimentRunner:
     Usage:
         run_configs = [run1, run2, run3, run4, run5, run6]
         exec_config = ExecutionerConfig()
-        runner      = ExperimentRunner(run_configs, exec_config, factory, device)
-        hps         = runner.tune_all()   # optional
-        summary     = runner.run_all()
+        runner  = ExperimentRunner(run_configs, exec_config, factory, device)
+        hps     = runner.tune_all()   # optional — inspect and apply in notebook
+        summary = runner.run_all()
 
     Access individual results:
         runner.run_results['run1_cnn_standard']
@@ -393,6 +388,16 @@ class ExperimentRunner:
 
         tune_duration = time.time() - tune_start
         self._dump_tune_results(tune_id, tune_duration, all_hps)
+
+        # Delete tuner log files if save_tune_logs=False
+        if not self.exec_config.save_tune_logs:
+            import glob
+            pattern = os.path.join(self.exec_config.logs_dir, '*.log')
+            for log_file in glob.glob(pattern):
+                try:
+                    os.remove(log_file)
+                except OSError:
+                    pass
 
         print(f"\n{'='*70}")
         print(f"TUNE COMPLETE — {tune_duration/60:.1f}min")
@@ -774,20 +779,6 @@ class ExperimentRunner:
         if torch.cuda.is_available():
             device_name   = torch.cuda.get_device_name(0)
             device_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-
-        # Library versions
-        easyfsl_ver = None
-        pyg_ver     = None
-        try:
-            import easyfsl
-            easyfsl_ver = getattr(easyfsl, '__version__', 'unknown')
-        except ImportError:
-            pass
-        try:
-            import torch_geometric
-            pyg_ver = getattr(torch_geometric, '__version__', 'unknown')
-        except ImportError:
-            pass
 
         return ExperimentSummary(
             experiment_id    = experiment_id,
