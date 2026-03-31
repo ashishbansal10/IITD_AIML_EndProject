@@ -321,9 +321,9 @@ def run_smoke_test3(loader_factory, device, num_workers=0):
         n_trials        = 2,
         study_name      = 'smoke1_hp',
         storage         = None,
-        train_hp_choices = {
+        train_hp_choices = [{
             'lr': [1e-4, 1e-3],
-        },
+        }],
         proxy_epochs    = 2,            # ← overrides hardcoded max(10,...) in tuner
     )
 
