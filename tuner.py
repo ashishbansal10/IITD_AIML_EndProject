@@ -430,7 +430,7 @@ class HPTuner:
     def _select_pruner(self):
         """Simple conditional pruner selection."""
         # 1. Budget too low to build meaningful statistics
-        if self._n_trials < 10:
+        if self._n_trials <= 2:
             self._logger.info("Pruner: NopPruner (Budget too low)")
             return self._optuna.pruners.NopPruner()
 
@@ -439,7 +439,7 @@ class HPTuner:
         if self._n_trials >= self._total_combos:
             self._logger.info("Pruner: MedianPruner (Exhaustive Search)")
             return self._optuna.pruners.MedianPruner(
-                n_startup_trials=5, 
+                n_startup_trials=4, 
                 n_warmup_steps=2
             )
 
@@ -568,17 +568,37 @@ class HPTuner:
 
         # Shorten pretrain for tuning — proxy, not full train
         # Use 20% of full epochs — enough signal for relative comparison
-        base_proxy = self.tune_config.proxy_epochs if self.tune_config.proxy_epochs is not None else 10
-        proxy_pre = max(base_proxy, self.train_config.epochs_pretrain // 5)
-        proxy_trn = max(base_proxy, self.train_config.epochs_train // 5)
+        base_proxy = self.tune_config.proxy_epochs if self.tune_config.proxy_epochs is not None else 20
+
+        # 2. Calculate the Uniform Tune Factor
+        # Example: 20 / 100 = 0.2
+        tune_factor = max(0.1, min(1.0, base_proxy / min(self.train_config.epochs_pretrain, self.train_config.epochs_train)))
+
+        # 3. Apply UNIVERSAL FLOORS (Applied to all paradigms)
+        # These ensure that every trial—standard or few-shot—has a stable signal.
+        
+        # Epoch Floor: 5
+        trial_train_config.epochs_pretrain = max(5, int(self.train_config.epochs_pretrain * tune_factor))
+        trial_train_config.epochs_train    = max(5, int(self.train_config.epochs_train * tune_factor))
+
+        # Episode Floors: 20 train / 10 val
+        trial_train_config.episodes_train  = max(20, int(self.train_config.episodes_train * tune_factor))
+        trial_train_config.episodes_val    = max(10, int(self.train_config.episodes_val * tune_factor))
+
+        self._logger.info(
+            f"Trial {trial.number} | Factor: {tune_factor:.2f} | "
+            f"Workload: pretrain {trial_train_config.epochs_pretrain}ep, train {trial_train_config.epochs_train}ep, "
+            f"{trial_train_config.episodes_train}tr/{trial_train_config.episodes_val}vl episodes"
+        )
 
         # Determine the step index for the final report to avoid overlapping trainer steps
+        # The 'anchor' is the total number of epochs run
         if self.phase == 'pretrain':
-            final_report_step = proxy_pre
+            final_report_step = trial_train_config.epochs_pretrain
         elif self.phase == 'train':
-            final_report_step = proxy_trn
+            final_report_step = trial_train_config.epochs_train
         else: # phase == 'full'
-            final_report_step = proxy_pre + proxy_trn
+            final_report_step = trial_train_config.epochs_pretrain + trial_train_config.epochs_train
 
         # ── Run pretrain or train ─────────────────────────────────────
         TrainerClass = StandardTrainer if self.paradigm == 'standard' else FewShotTrainer
@@ -587,19 +607,17 @@ class HPTuner:
         val_metric = float('inf') # Initial guard
         try:
             if self.phase in ['pretrain', 'full']:
-                trial_train_config.epochs_pretrain = proxy_pre
-                self._logger.info(f"Trial {trial.number} | Running Pretrain (Proxy: {trial_train_config.epochs_pretrain} epochs)")
+                self._logger.info(f"Trial {trial.number} | Running Pretrain")
                 trainer.pretrain(optuna_trial=trial)
                 val_metric = trainer.impl.state.best_val_loss
 
             if self.phase in ['train', 'full']:
-                trial_train_config.epochs_train = proxy_trn
                 if self.phase == 'train':
+                    self._logger.info(f"Trial {trial.number} | Loading pretrain checkpoint from {self.load_checkpoint_path}")
                     ModelFactory.load(trial_model, self.load_checkpoint_path)
                     trainer.impl.state.is_pretrained = True
-                    self._logger.info(f"Trial {trial.number} | Loaded pretrain checkpoint from {self.load_checkpoint_path}")
 
-                self._logger.info(f"Trial {trial.number} | Running Train (Proxy: {trial_train_config.epochs_train} epochs)")
+                self._logger.info(f"Trial {trial.number} | Running Train)")
                 trainer.train(optuna_trial=trial)
                 val_metric = trainer.impl.state.best_val_loss
 
