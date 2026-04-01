@@ -352,6 +352,7 @@ class HPTuner:
                 "Or set tune_config=None in ExperimentConfig to skip tuning."
             )
 
+        print(f"Initializing HPTuner — run_id={self.run_id} phase={self.phase}")
         # ── Expand HP choices into internal combo lists ────────────────
         # Model and trainer kept as separate lists — never merged.
         self._model_combos   = _expand_hp_choices(tune_config.model_hp_choices)
@@ -369,6 +370,10 @@ class HPTuner:
         # ── Logger setup ──────────────────────────────────────────────
         self._log_path = None
         self._logger   = self._setup_logger(logs_dir)
+        if self._logger is None:
+            print("Logger setup failed — check logs_dir permissions.")
+        else:
+            self._logger.info(f"HPTuner initialized — run_id={self.run_id} phase={self.phase}")
 
     # ------------------------------------------------------------------
     # Auto resolution — n_trials / sampler / pruner
@@ -439,6 +444,7 @@ class HPTuner:
         Returns best HPs found as dict split by group:
             {'model': {k: v, ...}, 'trainer': {k: v, ...}}
         """
+        print(f"Running HPTuner — run_id={self.run_id} phase={self.phase} n_trials={self._n_trials} total_combos={self._total_combos}")
         optuna = self._optuna
 
         # Silence Optuna's own verbose logging — we handle output ourselves
