@@ -39,9 +39,10 @@ Tuning Modes (ExperimentConfig fields)
 
     best_hps will capture results from tuners:
     - None if no tuning
-    - full_tune_config → best_hps['full'] = {param: value}
-    - pretrain_tune_config → best_hps['pretrain'] = {param: value}
-    - train_tune_config → best_hps['train'] = {param: value}
+    - full_tune_config → best_hps['full'] = {'model': {param: value}, 'trainer': {param: value}}
+    - pretrain_tune_config → best_hps['pretrain'] = {'model': {param: value}, 'trainer': {param: value}}
+    - train_tune_config → best_hps['train'] = {'model': {param: value}, 'trainer': {param: value}} 
+        - however, 'model' is not tuned in train phase, so this will typically be empty or None.
 
 Parallel vs Sequential
 -----------------------
@@ -369,8 +370,8 @@ class ExperimentRunner:
             self._seed(run_cfg.random_seed)
 
             if run_cfg.full_tune_config is not None:
-                hps = self._run_tuner(run_cfg, run_cfg.full_tune_config, phase='full', ckpt_path=None)
-                all_hps[run_cfg.run_id] = {'full': hps}
+                full_hps = self._run_tuner(run_cfg, run_cfg.full_tune_config, phase='full', ckpt_path=None)
+                all_hps[run_cfg.run_id] = {'full': full_hps}
             else:
                 pretrain_hps, train_hps, ckpt = self._run_split_tuner_for_tune_all(run_cfg)
                 if ckpt:
@@ -596,8 +597,8 @@ class ExperimentRunner:
         if run_cfg.train_tune_config is not None:
             # Run full pretrain once to produce checkpoint for train tuner
             tmp_cfg = copy.deepcopy(run_cfg)
-            if pretrain_hps:
-                self._apply_train_hps(tmp_cfg, pretrain_hps, run_cfg.pretrain_tune_config)
+            if pretrain_hps and 'trainer' in pretrain_hps:
+                self._apply_train_hps(tmp_cfg, pretrain_hps['trainer'], run_cfg.pretrain_tune_config)
 
             tmp_model   = ModelFactory.create(tmp_cfg.model_config, device=self.device)
             tmp_trainer = self._make_trainer(tmp_cfg, tmp_model)
@@ -615,29 +616,27 @@ class ExperimentRunner:
     # HP application helpers
     # ------------------------------------------------------------------
 
-    def _apply_model_hps(self, model, run_cfg: ExperimentConfig,
-                         best_hps: dict, tune_cfg: TuneConfig):
+    def _apply_model_hps(self, model, run_cfg: ExperimentConfig, best_hps: dict, tune_cfg: TuneConfig):
         """
         Apply model_hp_choices HPs — rebuild model via ModelConfig.update_config.
         Returns (updated_model, updated_run_cfg).
         Model must be recreated since structural HPs require fresh instantiation.
         """
-        model_hps = {k: v for k, v in best_hps.items()
-                     if k in tune_cfg.model_hp_choices}
+        model_hps = best_hps['model'] if 'model' in best_hps else None
         if model_hps:
             run_cfg     = copy.deepcopy(run_cfg)
             updated_cfg = ModelConfig.update_config(run_cfg.model_config, **model_hps)
             model       = ModelFactory.create(updated_cfg, device=self.device)
         return model, run_cfg
 
-    def _apply_train_hps(self, run_cfg: ExperimentConfig,
-                         best_hps: dict, tune_cfg: TuneConfig) -> None:
+    def _apply_train_hps(self, run_cfg: ExperimentConfig, best_hps: dict, tune_cfg: TuneConfig) -> None:
         """
         Apply train_hp_choices HPs to run_cfg.train_config via setattr.
         Modifies run_cfg.train_config in place.
         """
-        for k, v in best_hps.items():
-            if k in tune_cfg.train_hp_choices:
+        trainer_hps = best_hps['trainer'] if 'trainer' in best_hps else None
+        if trainer_hps:
+            for k, v in trainer_hps.items():
                 if hasattr(run_cfg.train_config, k):
                     setattr(run_cfg.train_config, k, v)
 
@@ -664,8 +663,7 @@ class ExperimentRunner:
         path = os.path.join(self.exec_config.results_dir, f"tune_results_{tune_id}.json")
         os.makedirs(self.exec_config.results_dir, exist_ok=True)
         with open(path, 'w') as f:
-            json.dump({'tune_id': tune_id, 'duration_seconds': duration,
-                       'best_hps': all_hps}, f, indent=2)
+            json.dump({'tune_id': tune_id, 'duration_seconds': duration, 'best_hps': all_hps}, f, indent=2)
         print(f"\n  Tune results saved: {path}")
 
     def _seed(self, seed: int) -> None:

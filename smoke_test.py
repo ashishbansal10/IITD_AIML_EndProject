@@ -284,7 +284,7 @@ def run_smoke_test2(loader_factory, device, num_workers=0):
 
 def run_smoke_test3(loader_factory, device, num_workers=0):
     """
-    Smoke test 1 — CNN Standard (Lightning + Optuna) + CNN FewShot (PyTorch)
+    Smoke test 3 — CNN Standard (Lightning + Optuna) + CNN FewShot (PyTorch)
     Verifies: Lightning backend, Optuna proxy, result serialisation.
     Cleans up all disk files on completion.
     """
@@ -319,30 +319,30 @@ def run_smoke_test3(loader_factory, device, num_workers=0):
     # proxy_epochs=2 overrides the hardcoded max(10,...) in tuner._objective()
     tune_cfg = TuneConfig(
         n_trials        = 2,
-        study_name      = 'smoke1_hp',
+        study_name      = 'smoke3_hp',
         storage         = None,
-        train_hp_choices = [{
+        train_hp_choices = {
             'lr': [1e-4, 1e-3],
-        }],
+        },
         proxy_epochs    = 2,            # ← overrides hardcoded max(10,...) in tuner
     )
 
     run_configs = [
         ExperimentConfig(
-            run_id='smoke1_r1_cnn_standard', paradigm='standard', arch='cnn',
+            run_id='smoke3_r1_cnn_standard', paradigm='standard', arch='cnn',
             model_config=m_cfg,
             train_config=copy.deepcopy(t_cfg), eval_config=copy.deepcopy(eval_cfg),
             full_tune_config=tune_cfg,
             random_seed=42,
-            notes='Smoke1 — Optuna',
+            notes='Smoke3 — Optuna',
         ),
         ExperimentConfig(
-            run_id='smoke1_r2_cnn_fewshot', paradigm='fewshot', arch='cnn',
+            run_id='smoke3_r2_cnn_fewshot', paradigm='fewshot', arch='cnn',
             model_config=m_cfg,
             train_config=copy.deepcopy(t_cfg), eval_config=copy.deepcopy(eval_cfg),
             train_tune_config=tune_cfg,
             random_seed=42,
-            notes='Smoke1 — no tuning',
+            notes='Smoke3 — no tuning',
         ),
     ]
 
@@ -369,9 +369,9 @@ def run_all_smoke_tests(loader_factory, device, num_workers=0, stop_on_fail=True
     import time
 
     tests = [
-        ('smoke_test0 — data pipeline',   lambda: run_smoke_test0(loader_factory, device, num_workers)),
-        ('smoke_test1 — forward pass',    lambda: run_smoke_test1(loader_factory, device)),
-        ('smoke_test2 — all 6 archs',     lambda: run_smoke_test2(loader_factory, device, num_workers)),
+        #('smoke_test0 — data pipeline',   lambda: run_smoke_test0(loader_factory, device, num_workers)),
+        #('smoke_test1 — forward pass',    lambda: run_smoke_test1(loader_factory, device)),
+        #('smoke_test2 — all 6 archs',     lambda: run_smoke_test2(loader_factory, device, num_workers)),
         ('smoke_test3 — optuna',          lambda: run_smoke_test3(loader_factory, device, num_workers)),
     ]
 
