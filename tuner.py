@@ -352,7 +352,7 @@ class HPTuner:
                 "Or set tune_config=None in ExperimentConfig to skip tuning."
             )
 
-        print(f"Initializing HPTuner — run_id={self.run_id} phase={self.phase}")
+        print(f"Initializing HPTuner — run_id={self.run_id} paradigm={self.paradigm} phase={self.phase} logs_dir={logs_dir}")
         # ── Expand HP choices into internal combo lists ────────────────
         # Model and trainer kept as separate lists — never merged.
         self._model_combos   = _expand_hp_choices(tune_config.model_hp_choices)
@@ -373,7 +373,7 @@ class HPTuner:
         if self._logger is None:
             print("Logger setup failed — check logs_dir permissions.")
         else:
-            self._logger.info(f"HPTuner initialized — run_id={self.run_id} phase={self.phase}")
+            self._logger.info(f"HPTuner initialized — run_id={self.run_id} paradigm={self.paradigm} phase={self.phase} logs_dir={logs_dir}")
 
     # ------------------------------------------------------------------
     # Auto resolution — n_trials / sampler / pruner
@@ -419,13 +419,10 @@ class HPTuner:
         # ── Logger — detailed output to file, minimal to stdout ───────
 
         os.makedirs(logs_dir, exist_ok=True)
-        self._log_path = os.path.join(
-            logs_dir,
-            f"{self.run_id}_{self.tune_config.study_name}_{self.phase}.log"
-        )
-        self._logger = logging.getLogger(
-            f"tuner.{self.run_id}.{self.tune_config.study_name}.{self.phase}"
-        )
+        log_fname = f"tuner.{self.run_id}_{self.tune_config.study_name}_{self.phase}.log"
+        self._log_path = os.path.join(logs_dir, log_fname)
+        print(f"HPTuner log_fname: {log_fname} _log_path: {self._log_path}")
+        self._logger = logging.getLogger(log_fname)
         self._logger.setLevel(logging.DEBUG)
         self._logger.handlers.clear()
 
