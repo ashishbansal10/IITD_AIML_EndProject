@@ -90,7 +90,6 @@ from typing import Dict, List, Optional, Any, Union
 # ==============================================================================
 
 MAX_TRIALS_DEFAULT   = 30    # cap on auto-derived n_trials
-EXHAUSTIVE_THRESHOLD = 12    # below this → enumerate all combos exactly once
 MEDIAN_PRUNER_MIN    = 10    # below this → NopPruner
 HYPERBAND_MIN        = 30    # above this → HyperbandPruner (else MedianPruner)
 
@@ -358,14 +357,16 @@ class HPTuner:
         self._model_combos   = _expand_hp_choices(tune_config.model_hp_choices)
         self._trainer_combos   = _expand_hp_choices(tune_config.train_hp_choices)
 
-        # Total combos — None if either group uses callable
-        if self._model_combos is not None and self._trainer_combos is not None:
-            self._total_combos = len(self._model_combos) * len(self._trainer_combos)
-        else:
-            self._total_combos = max(len(self._model_combos), len(self._trainer_combos))
+        # Total combos depends on whether the model is fixed or searchable
+        m_len = len(self._model_combos) if (self._model_combos and not self.load_checkpoint_path) else 1
+        t_len = len(self._trainer_combos) if self._trainer_combos else 1
+
+        self._total_combos = m_len * t_len
 
         # ── Resolve n_trials ──────────────────────────────────────────
-        self._n_trials     = self._resolve_n_trials()
+        self._n_trials = self._resolve_n_trials()
+        self._sampler  = self._select_sampler()
+        self._pruner   = self._select_pruner()
 
         # ── Logger setup ──────────────────────────────────────────────
         self._log_path = None
@@ -396,20 +397,42 @@ class HPTuner:
 
 
     def _select_sampler(self):
-        """Instantiates the resolved Optuna sampler."""
-        self._logger.info(f"Sampler: TPESampler (size={len(self._total_combos) if self._total_combos else 0} model combos × {len(self._trainer_combos) if self._trainer_combos else 0})")
-        return self._optuna.samplers.TPESampler(seed=42)
+        """Instantiates GridSampler with a dynamic search space."""
+        grid_space = {}
+
+        # 1. Add model indices only if we aren't loading a checkpoint
+        if self._model_combos and not self.load_checkpoint_path:
+            grid_space['model_combo_idx'] = list(range(len(self._model_combos)))
+
+        # 2. Add trainer indices
+        if self._trainer_combos:
+            grid_space['trainer_combo_idx'] = list(range(len(self._trainer_combos)))
+
+        self._logger.info(f"Sampler: GridSampler (Exhaustive Grid: {self._total_combos} combos)")
+        return self._optuna.samplers.GridSampler(grid_space)
 
     def _select_pruner(self):
-        """Auto-select pruner based on effective n_trials."""
-        if self._n_trials <= 10:
-            self._logger.info(f"Pruner: NopPruner (n_trials={self._n_trials})")
+        """Simple conditional pruner selection."""
+        # 1. Budget too low to build meaningful statistics
+        if self._n_trials < 10:
+            self._logger.info("Pruner: NopPruner (Budget too low)")
             return self._optuna.pruners.NopPruner()
-        elif self._n_trials <= 30:
-            self._logger.info(f"Pruner: MedianPruner (n_trials={self._n_trials})")
-            return self._optuna.pruners.MedianPruner()
-        self._logger.info(f"Pruner: HyperbandPruner (n_trials={self._n_trials})")
-        return self._optuna.pruners.HyperbandPruner()
+
+        # 2. FULL GRID: We are testing everything (n_trials >= total_combos)
+        # Median is best here; it systematically kills the bottom 50%.
+        if self._n_trials >= self._total_combos:
+            self._logger.info("Pruner: MedianPruner (Exhaustive Search)")
+            return self._optuna.pruners.MedianPruner(
+                n_startup_trials=5, 
+                n_warmup_steps=2
+            )
+
+        # 3. PARTIAL SCAN: 30 trials chosen from a much larger grid
+        # Hyperband is the 'scuttle' king. It kills losers aggressively 
+        # to ensure your 30 trials find the absolute best winners.
+        else:
+            self._logger.info(f"Pruner: HyperbandPruner (Partial Scan: {self._n_trials}/{self._total_combos})")
+            return self._optuna.pruners.HyperbandPruner(min_resource=2)
 
     # ------------------------------------------------------------------
     # Logger setup
@@ -448,16 +471,13 @@ class HPTuner:
         # Silence Optuna's own verbose logging — we handle output ourselves
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-        sampler = self._select_sampler()
-        pruner  = self._select_pruner()
-
         # Create or load study
         study = optuna.create_study(
             study_name     = self.tune_config.study_name,
             storage        = self.tune_config.storage,
             direction      = 'minimize',    # minimize val_loss
-            sampler        = sampler,
-            pruner         = pruner,
+            sampler        = self._sampler,
+            pruner         = self._pruner,
             load_if_exists = True           # resume if storage set + study exists
         )
 
@@ -508,22 +528,21 @@ class HPTuner:
         # ── Sample model HPs only in pretrain-phase tuning ────────────
         # When load_checkpoint_path set (train-phase tuning), model is fixed —
         # model HPs cannot meaningfully change loaded weights.
-        model_combo = None
-        if not self.load_checkpoint_path:
-            if self._model_combos and len(self._model_combos) > 1:
-                idx         = trial.suggest_int('model_combo_idx', 0, len(self._model_combos) - 1)
-                model_combo = self._model_combos[idx]
-            else:
-                # Single combo or empty — no suggest needed
-                model_combo = self._model_combos[0] if self._model_combos else {}
+        model_combo = {}
+        if self._model_combos and not self.load_checkpoint_path:
+            # Always suggest if in Grid mode to keep sampler keys aligned
+            idx = trial.suggest_int('model_combo_idx', 0, len(self._model_combos) - 1)
+            model_combo = self._model_combos[idx]
+        else:
+            # Model is fixed. We do NOT call trial.suggest_int here 
+            # so Optuna doesn't try to optimize a fixed component.
+            model_combo = self._model_combos[0] if self._model_combos else {}
 
         # ── Sample train HPs always ───────────────────────────────────
-        trainer_combo = None
-        if self._trainer_combos and len(self._trainer_combos) > 1:
-            idx           = trial.suggest_int('trainer_combo_idx', 0, len(self._trainer_combos) - 1)
+        trainer_combo = {}
+        if self._trainer_combos:
+            idx = trial.suggest_int('trainer_combo_idx', 0, len(self._trainer_combos) - 1)
             trainer_combo = self._trainer_combos[idx]
-        else:
-            trainer_combo = self._trainer_combos[0] if self._trainer_combos else {}
 
         self._logger.info(f"\nTrial {trial.number} | model={model_combo} trainer={trainer_combo}")
 
@@ -562,17 +581,20 @@ class HPTuner:
         TrainerClass = StandardTrainer if self.paradigm == 'standard' else FewShotTrainer
         trainer = TrainerClass(trial_model, self.factory, trial_train_config, self.device)
 
+        val_metric = float('inf') # Initial guard
         try:
             if self.load_checkpoint_path:
                 trainer.impl.state.is_pretrained = True
-                trainer.train()
+                trainer.train(optuna_trial=trial)           # for pruner to track training steps & take pruning decisions
             else:
-                trainer.pretrain()
+                trainer.pretrain(optuna_trial=trial)        # for pruner to track training steps & take pruning decisions
 
             val_metric = trainer.impl.state.best_val_loss
+            trial.report(val_metric, step=proxy)
             self._logger.info(f"Trial {trial.number} | val_metric={val_metric:.4f}")
 
         except self._optuna.exceptions.TrialPruned:
+            self._logger.info(f"Trial {trial.number} SCUTTLED (Early Exit) via Pruner")
             raise
         except Exception as e:
             self._logger.error(f"Trial {trial.number} failed: {e}")
@@ -583,12 +605,6 @@ class HPTuner:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-        # ── Report intermediate value for pruning ─────────────────────
-        trial.report(val_metric, step=trial_train_config.epochs_pretrain)
-        if trial.should_prune():
-            self._logger.info(f"Trial {trial.number} PRUNED | val_loss={val_metric:.4f}")
-            raise self._optuna.exceptions.TrialPruned()
 
         self._logger.info(f"Trial {trial.number} END | val_loss={val_metric:.4f}")
         return val_metric

@@ -448,7 +448,7 @@ class TrainerImpl:
 
     # ------------------------------------------------------------------
 
-    def pretrain(self):
+    def pretrain(self, optuna_trial=None):
         """
         Phase 1 — shared pretrain for both paradigms.
         Batch mode, CrossEntropyLoss on raw logits.
@@ -462,7 +462,7 @@ class TrainerImpl:
         print(f"\n  Phase 1: Pretrain [pytorch | {self.config.epochs_pretrain} epochs]")
         self.model.freeze('prototypical')
 
-        self._pretrain_pytorch()
+        self._pretrain_pytorch(optuna_trial=optuna_trial)
 
         self.model.unfreeze('prototypical')
 
@@ -479,7 +479,7 @@ class TrainerImpl:
         if self.config.ewc_lambda > 0:
             self._compute_fisher()
 
-    def train_batch(self, val_pool: str = 'val_seen'):
+    def train_batch(self, val_pool: str = 'val_seen', optuna_trial=None):
         """
         Phase 2a — standard batch training.
         Called by StandardTrainer.
@@ -498,7 +498,8 @@ class TrainerImpl:
         self._run_train_pytorch(
             train_pool = 'train',
             val_pool   = val_pool,
-            episodic   = False
+            episodic   = False,
+            optuna_trial=optuna_trial
         )
 
         self.model.unfreeze('prototypical')
@@ -507,7 +508,7 @@ class TrainerImpl:
         self._load_train_best()
         self.state.is_trained = True
 
-    def train_episodic(self, val_pool: str = 'val_unseen'):
+    def train_episodic(self, val_pool: str = 'val_unseen', optuna_trial=None):
         """
         Phase 2b — episodic meta-training.
         Called by FewShotTrainer.
@@ -530,7 +531,8 @@ class TrainerImpl:
         self._run_train_pytorch(
             train_pool = 'train',
             val_pool   = val_pool,
-            episodic   = True
+            episodic   = True,
+            optuna_trial=optuna_trial
         )
 
         # Unfreeze for evaluation
@@ -549,7 +551,7 @@ class TrainerImpl:
     # PyTorch — pretrain
     # ------------------------------------------------------------------
 
-    def _pretrain_pytorch(self):
+    def _pretrain_pytorch(self, optuna_trial=None):
         """Batch pretrain loop — pure PyTorch."""
         optimizer = self._setup_optimizer()
         scheduler = self._setup_scheduler(optimizer, self.config.epochs_pretrain)
@@ -582,6 +584,14 @@ class TrainerImpl:
             if self.config.verbose:
                 self._log_epoch('pretrain', epoch, train_loss, train_acc, val_loss, val_acc)
 
+            # --- INSERTED CODE START for Optuna ---
+            if optuna_trial is not None:
+                optuna_trial.report(val_loss, step=epoch)
+                if optuna_trial.should_prune():
+                    import optuna
+                    raise optuna.TrialPruned()
+            # --- INSERTED CODE END ---
+
             # Checkpoint on improvement
             if self._is_improved(val_loss, val_acc):
                 path = os.path.join( self.config.checkpoint_dir, f"{self.config.run_id}_pretrain_best.pt" )
@@ -607,7 +617,7 @@ class TrainerImpl:
     # PyTorch — train (batch or episodic)
     # ------------------------------------------------------------------
 
-    def _run_train_pytorch(self, train_pool: str, val_pool: str, episodic: bool):
+    def _run_train_pytorch(self, train_pool: str, val_pool: str, episodic: bool, optuna_trial=None):
         """
         Generic train loop — batch or episodic.
         Episodic: trains backbone via prototypical loss.
@@ -681,6 +691,14 @@ class TrainerImpl:
             self.history.log_train(epoch, train_loss, train_acc, val_loss, val_acc)
             if self.config.verbose:
                 self._log_epoch('train', epoch, train_loss, train_acc, val_loss, val_acc)
+
+            # --- INSERTED CODE START for Optuna ---
+            if optuna_trial is not None:
+                optuna_trial.report(val_loss, step=epoch)
+                if optuna_trial.should_prune():
+                    import optuna
+                    raise optuna.TrialPruned()
+            # --- INSERTED CODE END ---
 
             # Checkpoint on improvement
             if self._is_improved(val_loss, val_acc):
@@ -1103,13 +1121,13 @@ class StandardTrainer:
             paradigm = 'standard'
         )
 
-    def pretrain(self):
+    def pretrain(self, optuna_trial=None):
         """Phase 1 — batch pretrain, shared with FewShot."""
-        self.impl.pretrain()
+        self.impl.pretrain(optuna_trial=optuna_trial)
 
-    def train(self):
+    def train(self, optuna_trial=None):
         """Phase 2a — batch training on seen classes."""
-        self.impl.train_batch(val_pool='val_seen')
+        self.impl.train_batch(val_pool='val_seen', optuna_trial=optuna_trial)
 
     @property
     def state(self) -> TrainingState:
@@ -1156,13 +1174,13 @@ class FewShotTrainer:
             paradigm = 'fewshot'
         )
 
-    def pretrain(self):
+    def pretrain(self, optuna_trial=None):
         """Phase 1 — batch pretrain, shared with Standard."""
-        self.impl.pretrain()
+        self.impl.pretrain(optuna_trial=optuna_trial)
 
-    def train(self):
+    def train(self, optuna_trial=None):
         """Phase 2b — episodic meta-training on base classes."""
-        self.impl.train_episodic(val_pool='val_unseen')
+        self.impl.train_episodic(val_pool='val_unseen', optuna_trial=optuna_trial)
 
     @property
     def state(self) -> TrainingState:
