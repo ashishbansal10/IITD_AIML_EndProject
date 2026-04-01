@@ -422,14 +422,15 @@ class HPTuner:
         log_fname = f"tuner.{self.run_id}_{self.tune_config.study_name}_{self.phase}.log"
         self._log_path = os.path.join(logs_dir, log_fname)
         print(f"HPTuner log_fname: {log_fname} _log_path: {self._log_path}")
-        self._logger = logging.getLogger(log_fname)
-        self._logger.setLevel(logging.DEBUG)
-        self._logger.handlers.clear()
+        logger = logging.getLogger(log_fname)
+        logger.setLevel(logging.DEBUG)
+        logger.handlers.clear()
 
         fh = logging.FileHandler(self._log_path, mode='w')
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s | %(message)s'))
-        self._logger.addHandler(fh)
+        logger.addHandler(fh)
+        return logger
 
     # ------------------------------------------------------------------
     # run()
