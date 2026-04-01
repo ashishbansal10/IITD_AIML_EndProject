@@ -566,20 +566,18 @@ class HPTuner:
 
         # Shorten pretrain for tuning — proxy, not full train
         # Use 20% of full epochs — enough signal for relative comparison
-        proxy = (self.tune_config.proxy_epochs
-                      if self.tune_config.proxy_epochs is not None
-                      else max(10, self.train_config.epochs_pretrain // 5))
-        trial_train_config.epochs_pretrain = proxy
-        self._logger.info(f"Trial {trial.number} | proxy pretrain epochs: {proxy}")
-
+        proxy = self.tune_config.proxy_epochs if self.tune_config.proxy_epochs is not None else 10
         if self.load_checkpoint_path:
-            # ── Train-phase tuning — reload pretrain checkpoint ───────
             ModelFactory.load(trial_model, self.load_checkpoint_path)
-            self._logger.info(f"Trial {trial.number} | loaded pretrain ckpt: {self.load_checkpoint_path}")
+            proxy = max(proxy, self.train_config.epochs_train // 5)
+            trial_train_config.epochs_train    = proxy
+            self._logger.info(f"Trial {trial.number} | loaded pretrain ckpt: {self.load_checkpoint_path} | running train | proxy train epochs: {proxy}")
         else:
-            # ── Pretrain-phase tuning — shorten epochs for proxy ──────
-                pass  # proxy epochs already set above
+            proxy = max(proxy, self.train_config.epochs_pretrain // 5)
+            trial_train_config.epochs_pretrain = proxy
+            self._logger.info(f"Trial {trial.number} | loaded pretrain ckpt: {self.load_checkpoint_path} | running pretrain | proxy pretrain epochs: {proxy}")
 
+        # ── Run pretrain or train ─────────────────────────────────────
         TrainerClass = StandardTrainer if self.paradigm == 'standard' else FewShotTrainer
         trainer = TrainerClass(trial_model, self.factory, trial_train_config, self.device)
 
