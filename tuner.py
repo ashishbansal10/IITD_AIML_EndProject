@@ -352,6 +352,13 @@ class HPTuner:
             )
 
         print(f"Initializing HPTuner — run_id={self.run_id} paradigm={self.paradigm} phase={self.phase} logs_dir={logs_dir}")
+
+        # ── Logger setup ──────────────────────────────────────────────
+        self._log_path = None
+        self._logger   = self._setup_logger(logs_dir)
+        if self._logger is None:
+            raise RuntimeError(f"HPTuner initialization failed. Check {logs_dir} permissions.")
+
         # ── Expand HP choices into internal combo lists ────────────────
         # Model and trainer kept as separate lists — never merged.
         self._model_combos   = _expand_hp_choices(tune_config.model_hp_choices)
@@ -368,13 +375,8 @@ class HPTuner:
         self._sampler  = self._select_sampler()
         self._pruner   = self._select_pruner()
 
-        # ── Logger setup ──────────────────────────────────────────────
-        self._log_path = None
-        self._logger   = self._setup_logger(logs_dir)
-        if self._logger is None:
-            print("Logger setup failed — check logs_dir permissions.")
-        else:
-            self._logger.info(f"HPTuner initialized — run_id={self.run_id} paradigm={self.paradigm} phase={self.phase} logs_dir={logs_dir}")
+        self._logger.info(f"HPTuner initialized — run_id={self.run_id} paradigm={self.paradigm} phase={self.phase} logs_dir={logs_dir}")
+
 
     # ------------------------------------------------------------------
     # Auto resolution — n_trials / sampler / pruner
