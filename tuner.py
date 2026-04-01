@@ -335,6 +335,8 @@ class HPTuner:
         self.phase                = phase
         self.load_checkpoint_path = load_checkpoint_path
 
+        self._validate_config()
+
         # Best HPs found — populated after run()
         # {'model': {k: v, ...}, 'trainer': {k: v, ...}}
         self.best_hps:   Dict[str, Any] = {}
@@ -361,14 +363,11 @@ class HPTuner:
 
         # ── Expand HP choices into internal combo lists ────────────────
         # Model and trainer kept as separate lists — never merged.
-        self._model_combos   = _expand_hp_choices(tune_config.model_hp_choices)
-        self._trainer_combos   = _expand_hp_choices(tune_config.train_hp_choices)
-
         # Total combos depends on whether the model is fixed or searchable
-        m_len = len(self._model_combos) if (self._model_combos and not self.load_checkpoint_path) else 1
-        t_len = len(self._trainer_combos) if self._trainer_combos else 1
-
-        self._total_combos = m_len * t_len
+        model_input = tune_config.model_hp_choices if self.phase != 'train' else None
+        self._model_combos   = _expand_hp_choices(model_input)
+        self._trainer_combos   = _expand_hp_choices(tune_config.train_hp_choices)
+        self._total_combos = len(self._model_combos) * len(self._trainer_combos)
 
         # ── Resolve n_trials ──────────────────────────────────────────
         self._n_trials = self._resolve_n_trials()
@@ -377,6 +376,22 @@ class HPTuner:
 
         self._logger.info(f"HPTuner initialized — run_id={self.run_id} paradigm={self.paradigm} phase={self.phase} logs_dir={logs_dir}")
 
+    def _validate_config(self):
+        """Validates tuning phase requirements and checkpoint constraints."""
+        valid_phases = ['pretrain', 'train', 'full']
+        if self.phase not in valid_phases:
+            raise ValueError(f"Invalid phase '{self.phase}'. Must be one of {valid_phases}")
+
+        if self.phase == 'train':
+            if not self.load_checkpoint_path:
+                raise ValueError("Phase 'train' requires 'load_checkpoint_path' (pretrain weights).")
+        
+        if self.phase in ['pretrain', 'full']:
+            if self.load_checkpoint_path:
+                 # In pretrain/full, we start from scratch. 
+                 # If a path is provided, we should warn or raise. 
+                 # Based on your requirements, it has to be None.
+                 raise ValueError(f"Phase '{self.phase}' must start from scratch. Set 'load_checkpoint_path' to None.")
 
     # ------------------------------------------------------------------
     # Auto resolution — n_trials / sampler / pruner
@@ -402,12 +417,11 @@ class HPTuner:
         """Instantiates GridSampler with a dynamic search space."""
         grid_space = {}
 
-        # 1. Add model indices only if we aren't loading a checkpoint
-        if self._model_combos and not self.load_checkpoint_path:
+        # Only add indices to the grid if there is actually something to sample (>1 choice)
+        if len(self._model_combos) > 1:
             grid_space['model_combo_idx'] = list(range(len(self._model_combos)))
 
-        # 2. Add trainer indices
-        if self._trainer_combos:
+        if len(self._trainer_combos) > 1:
             grid_space['trainer_combo_idx'] = list(range(len(self._trainer_combos)))
 
         self._logger.info(f"Sampler: GridSampler (Exhaustive Grid: {self._total_combos} combos)")
@@ -499,9 +513,9 @@ class HPTuner:
         self.best_trial = study.best_trial
         self.best_hps   = self._resolve_best_hps(study.best_trial.params)
 
+        self.print_summary()
         self._logger.info(f"Tuner complete [{self.run_id}] — best_trial={study.best_trial.number} best_value={study.best_trial.value:.4f} best_hps={self.best_hps} log={self._log_path}")
         print(f"  Tuner complete [{self.run_id}] — best_trial={study.best_trial.number} best_value={study.best_trial.value:.4f} best_hps={self.best_hps} log={self._log_path}")
-
         return self.best_hps
 
     def _objective(self, trial) -> float:
@@ -530,30 +544,18 @@ class HPTuner:
         # ── Sample model HPs only in pretrain-phase tuning ────────────
         # When load_checkpoint_path set (train-phase tuning), model is fixed —
         # model HPs cannot meaningfully change loaded weights.
-        model_combo = {}
-        if self._model_combos and not self.load_checkpoint_path:
-            # Always suggest if in Grid mode to keep sampler keys aligned
-            idx = trial.suggest_int('model_combo_idx', 0, len(self._model_combos) - 1)
-            model_combo = self._model_combos[idx]
-        else:
-            # Model is fixed. We do NOT call trial.suggest_int here 
-            # so Optuna doesn't try to optimize a fixed component.
-            model_combo = self._model_combos[0] if self._model_combos else {}
+        m_idx = trial.suggest_int('model_combo_idx', 0, len(self._model_combos)-1) if len(self._model_combos) > 1 else 0
+        model_combo   = self._model_combos[m_idx]
 
-        # ── Sample train HPs always ───────────────────────────────────
-        trainer_combo = {}
-        if self._trainer_combos:
-            idx = trial.suggest_int('trainer_combo_idx', 0, len(self._trainer_combos) - 1)
-            trainer_combo = self._trainer_combos[idx]
+        # ── Sample trainer HPs ────────────────────────────────────────
+        t_idx = trial.suggest_int('trainer_combo_idx', 0, len(self._trainer_combos)-1) if len(self._trainer_combos) > 1 else 0
+        trainer_combo = self._trainer_combos[t_idx]
 
         self._logger.info(f"\nTrial {trial.number} | model={model_combo} trainer={trainer_combo}")
 
         # ── Fresh model — apply model HPs via ModelConfig.update_config ──
         # Original model_config untouched — copy with overridden model HPs
-        if model_combo:
-            trial_model_config = ModelConfig.update_config(self.model_config, **model_combo)
-        else:
-            trial_model_config = self.model_config
+        trial_model_config = ModelConfig.update_config(self.model_config, **model_combo) if model_combo else self.model_config
         trial_model = ModelFactory.create(trial_model_config, device=self.device)
 
         # ── Fresh TrainConfig copy — apply train HPs via setattr ──────
@@ -566,16 +568,17 @@ class HPTuner:
 
         # Shorten pretrain for tuning — proxy, not full train
         # Use 20% of full epochs — enough signal for relative comparison
-        proxy = self.tune_config.proxy_epochs if self.tune_config.proxy_epochs is not None else 10
-        if self.load_checkpoint_path:
-            ModelFactory.load(trial_model, self.load_checkpoint_path)
-            proxy = max(proxy, self.train_config.epochs_train // 5)
-            trial_train_config.epochs_train    = proxy
-            self._logger.info(f"Trial {trial.number} | loaded pretrain ckpt: {self.load_checkpoint_path} | running train | proxy train epochs: {proxy}")
-        else:
-            proxy = max(proxy, self.train_config.epochs_pretrain // 5)
-            trial_train_config.epochs_pretrain = proxy
-            self._logger.info(f"Trial {trial.number} | loaded pretrain ckpt: {self.load_checkpoint_path} | running pretrain | proxy pretrain epochs: {proxy}")
+        base_proxy = self.tune_config.proxy_epochs if self.tune_config.proxy_epochs is not None else 10
+        proxy_pre = max(base_proxy, self.train_config.epochs_pretrain // 5)
+        proxy_trn = max(base_proxy, self.train_config.epochs_train // 5)
+
+        # Determine the step index for the final report to avoid overlapping trainer steps
+        if self.phase == 'pretrain':
+            final_report_step = proxy_pre
+        elif self.phase == 'train':
+            final_report_step = proxy_trn
+        else: # phase == 'full'
+            final_report_step = proxy_pre + proxy_trn
 
         # ── Run pretrain or train ─────────────────────────────────────
         TrainerClass = StandardTrainer if self.paradigm == 'standard' else FewShotTrainer
@@ -583,14 +586,27 @@ class HPTuner:
 
         val_metric = float('inf') # Initial guard
         try:
-            if self.load_checkpoint_path:
-                trainer.impl.state.is_pretrained = True
-                trainer.train(optuna_trial=trial)           # for pruner to track training steps & take pruning decisions
-            else:
-                trainer.pretrain(optuna_trial=trial)        # for pruner to track training steps & take pruning decisions
+            if self.phase in ['pretrain', 'full']:
+                trial_train_config.epochs_pretrain = proxy_pre
+                self._logger.info(f"Trial {trial.number} | Running Pretrain (Proxy: {trial_train_config.epochs_pretrain} epochs)")
+                trainer.pretrain(optuna_trial=trial)
+                val_metric = trainer.impl.state.best_val_loss
 
-            val_metric = trainer.impl.state.best_val_loss
-            trial.report(val_metric, step=proxy)
+            if self.phase in ['train', 'full']:
+                trial_train_config.epochs_train = proxy_trn
+                if self.phase == 'train':
+                    ModelFactory.load(trial_model, self.load_checkpoint_path)
+                    trainer.impl.state.is_pretrained = True
+                    self._logger.info(f"Trial {trial.number} | Loaded pretrain checkpoint from {self.load_checkpoint_path}")
+
+                self._logger.info(f"Trial {trial.number} | Running Train (Proxy: {trial_train_config.epochs_train} epochs)")
+                trainer.train(optuna_trial=trial)
+                val_metric = trainer.impl.state.best_val_loss
+
+            # ── THE FINAL REPORT (Re-integrated) ──
+            # We report the absolute best value found across the phase(s) 
+            # at a dedicated 'final' step.
+            trial.report(val_metric, step=final_report_step)
             self._logger.info(f"Trial {trial.number} | val_metric={val_metric:.4f}")
 
         except self._optuna.exceptions.TrialPruned:
