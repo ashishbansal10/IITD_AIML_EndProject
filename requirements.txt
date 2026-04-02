@@ -22,8 +22,10 @@ torch-cluster
 timm>=0.9.0
 easyfsl>=1.4.0
 optuna>=3.0.0
+optuna-dashboard
 
 # --- Visualization & Media ---
 matplotlib
 seaborn
 tqdm>=4.0.0
+plotly

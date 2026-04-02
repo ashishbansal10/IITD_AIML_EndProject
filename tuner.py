@@ -33,7 +33,8 @@ Formats A and B are equivalent to sklearn's param_grid.
 
 Internal Handling
 -----------------
-Formats A & B → enumerate all valid combos → index sampling via trial.suggest_int.
+Formats A & B → enumerate all valid combos → index sampling via trial.suggest_categorical.
+                GridSampler exhausts indices systematically; TPESampler learns best indices.
     GridSampler intentionally NOT used — fails on list-of-dict-of-lists.
     Enqueue also NOT used — TPE samples beyond queue ignore constraints.
     Index trick: TPE learns which combo index performs best. Constraints naturally
@@ -238,11 +239,13 @@ class TuneConfig:
 
     # Trial control
     n_trials:         Optional[int]  = None        # None → auto-derived
+    proxy_epochs:     Optional[int]  = None        # None → max(10, epochs_pretrain // 5)
+    min_resources:    Optional[int]  = None        # for HyperbandPruner — None → auto-derived
+
     study_name:       str            = 'hp_search'
     storage:          Optional[str]  = None        # None=memory, 'sqlite:///hp.db'=persistent
 
     # Proxy training length per trial
-    proxy_epochs:     Optional[int]  = None        # None → max(10, epochs_pretrain // 5)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -271,8 +274,8 @@ class HPTuner:
         total = len(model_combos) × len(trainer_combos)
 
     Internal sampling strategy:
-        Formats A & B (grid) → enumerate all valid combos → trial.suggest_int
-                                over combo index → TPE learns best index.
+        Formats A & B (grid) → enumerate all valid combos → trial.suggest_categorical
+                                over combo index — works for both GridSampler and TPESampler.
                                 Constraints naturally respected — invalid combos
                                 never exist in the enumerated list.
 
@@ -414,41 +417,80 @@ class HPTuner:
 
 
     def _select_sampler(self):
-        """Instantiates GridSampler with a dynamic search space."""
+        """
+        Auto-select sampler based on total combo space size vs n_trials:
+            total_combos <= 12 OR n_trials >= total_combos
+                → GridSampler (exhaustive, guaranteed coverage)
+            total_combos > 12 AND n_trials < total_combos
+                → TPESampler (Bayesian, seeded for reproducibility)
+                  TPE learns which regions are promising after n_startup=10 random trials.
+        """
         grid_space = {}
-
-        # Only add indices to the grid if there is actually something to sample (>1 choice)
         if len(self._model_combos) > 1:
             grid_space['model_combo_idx'] = list(range(len(self._model_combos)))
-
         if len(self._trainer_combos) > 1:
             grid_space['trainer_combo_idx'] = list(range(len(self._trainer_combos)))
 
-        self._logger.info(f"Sampler: GridSampler (Exhaustive Grid: {self._total_combos} combos)")
-        return self._optuna.samplers.GridSampler(grid_space)
+        if self._total_combos <= 12 or self._n_trials >= self._total_combos:
+            self._logger.info(f"Sampler: GridSampler (exhaustive: {self._total_combos} combos)")
+            return self._optuna.samplers.GridSampler(grid_space)
+        else:
+            self._logger.info(
+                f"Sampler: TPESampler (partial scan: {self._n_trials}/{self._total_combos} combos)"
+            )
+            return self._optuna.samplers.TPESampler(seed=42)
 
     def _select_pruner(self):
-        """Simple conditional pruner selection."""
-        # 1. Budget too low to build meaningful statistics
+        """
+        Auto-select pruner based on n_trials vs total_combos.
+
+        min_resource resolution (controls earliest epoch Optuna may prune):
+            tune_config.min_resources set → use directly
+            None → auto: max(5, proxy_epochs // 3)
+                   e.g. proxy=30 → 10, proxy=20 → 6, proxy=10 → 5
+
+        Pruner selected:
+            n_trials <= 2
+                → NopPruner (too few trials for statistics)
+            n_trials >= total_combos (exhaustive)
+                → MedianPruner(n_startup_trials=5, n_warmup_steps=min_res)
+                   kills bottom 50% after warmup
+            n_trials < total_combos (partial scan)
+                → HyperbandPruner(min=min_res, max=proxy_epochs, factor=3)
+                   progressive brackets, best for large partial scans
+        """
+        proxy   = self.tune_config.proxy_epochs or 20
+        min_res = self.tune_config.min_resources
+        if min_res is None:
+            min_res = max(5, proxy // 3)
+
+        max_res = proxy
+
         if self._n_trials <= 2:
-            self._logger.info("Pruner: NopPruner (Budget too low)")
+            self._logger.info("Pruner: NopPruner (budget too low)")
             return self._optuna.pruners.NopPruner()
 
-        # 2. FULL GRID: We are testing everything (n_trials >= total_combos)
-        # Median is best here; it systematically kills the bottom 50%.
-        if self._n_trials >= self._total_combos:
-            self._logger.info("Pruner: MedianPruner (Exhaustive Search)")
-            return self._optuna.pruners.MedianPruner(
-                n_startup_trials=4, 
-                n_warmup_steps=2
+        if (self._n_trials >= self._total_combos) or (max_res <= min_res):
+            self._logger.info(
+                f"Pruner: MedianPruner (exhaustive or Hyperband not viable: "
+                f"n_trials={self._n_trials} combos={self._total_combos} "
+                f"min_res={min_res} max_res={max_res})"
             )
-
-        # 3. PARTIAL SCAN: 30 trials chosen from a much larger grid
-        # Hyperband is the 'scuttle' king. It kills losers aggressively 
-        # to ensure your 30 trials find the absolute best winners.
+            return self._optuna.pruners.MedianPruner(
+                n_startup_trials = 5,
+                n_warmup_steps   = min_res,
+                interval_steps   = 1,
+            )
         else:
-            self._logger.info(f"Pruner: HyperbandPruner (Partial Scan: {self._n_trials}/{self._total_combos})")
-            return self._optuna.pruners.HyperbandPruner(min_resource=2)
+            self._logger.info(
+                f"Pruner: HyperbandPruner (partial {self._n_trials}/{self._total_combos}, "
+                f"min={min_res} max={max_res} factor=3)"
+            )
+            return self._optuna.pruners.HyperbandPruner(
+                min_resource     = min_res,
+                max_resource     = max_res,
+                reduction_factor = 3,
+            )
 
     # ------------------------------------------------------------------
     # Logger setup
@@ -513,9 +555,20 @@ class HPTuner:
         self.best_trial = study.best_trial
         self.best_hps   = self._resolve_best_hps(study.best_trial.params)
 
-        self.print_summary()
-        self._logger.info(f"Tuner complete [{self.run_id}] — best_trial={study.best_trial.number} best_value={study.best_trial.value:.4f} best_hps={self.best_hps} log={self._log_path}")
-        print(f"  Tuner complete [{self.run_id}] — best_trial={study.best_trial.number} best_value={study.best_trial.value:.4f} best_hps={self.best_hps} log={self._log_path}")
+        self.print_summary(study)
+        self._export_visualizations(study)
+        self._logger.info(
+            f"Tuner complete [{self.run_id}] — "
+            f"best_trial={study.best_trial.number} "
+            f"best_value={study.best_trial.value:.4f} "
+            f"best_hps={self.best_hps} log={self._log_path}"
+        )
+        print(
+            f"  Tuner complete [{self.run_id}] — "
+            f"best_trial={study.best_trial.number} "
+            f"best_value={study.best_trial.value:.4f} "
+            f"best_hps={self.best_hps} log={self._log_path}"
+        )
         return self.best_hps
 
     def _objective(self, trial) -> float:
@@ -524,8 +577,8 @@ class HPTuner:
         Samples model + trainer HP combos → applies to fresh copies → runs pretrain.
 
         Grid inputs (Formats A & B):
-            trial.suggest_int('model_combo_idx', 0, N-1) → index into model_combos
-            trial.suggest_int('trainer_combo_idx', 0, M-1) → index into trainer_combos
+            trial.suggest_categorical('model_combo_idx', [0..N-1]) → index into model_combos
+            trial.suggest_categorical('trainer_combo_idx', [0..M-1]) → index into trainer_combos
             TPE learns which index is best. Constraints naturally respected —
             invalid combos never appear in the enumerated list.
 
@@ -544,11 +597,18 @@ class HPTuner:
         # ── Sample model HPs only in pretrain-phase tuning ────────────
         # When load_checkpoint_path set (train-phase tuning), model is fixed —
         # model HPs cannot meaningfully change loaded weights.
-        m_idx = trial.suggest_int('model_combo_idx', 0, len(self._model_combos)-1) if len(self._model_combos) > 1 else 0
-        model_combo   = self._model_combos[m_idx]
+        # suggest_categorical over index list works for both GridSampler and TPESampler:
+        #   GridSampler — exhausts all indices systematically
+        #   TPESampler  — treats each index as discrete category, learns best ones
+        m_idx = trial.suggest_categorical(
+            'model_combo_idx', list(range(len(self._model_combos)))
+        ) if len(self._model_combos) > 1 else 0
+        model_combo = self._model_combos[m_idx]
 
         # ── Sample trainer HPs ────────────────────────────────────────
-        t_idx = trial.suggest_int('trainer_combo_idx', 0, len(self._trainer_combos)-1) if len(self._trainer_combos) > 1 else 0
+        t_idx = trial.suggest_categorical(
+            'trainer_combo_idx', list(range(len(self._trainer_combos)))
+        ) if len(self._trainer_combos) > 1 else 0
         trainer_combo = self._trainer_combos[t_idx]
 
         self._logger.info(f"\nTrial {trial.number} | model={model_combo} trainer={trainer_combo}")
@@ -612,11 +672,36 @@ class HPTuner:
                 trainer.train(optuna_trial=trial)
                 val_metric = trainer.impl.state.best_val_loss
 
-            # ── THE FINAL REPORT (Re-integrated) ──
-            # We report the absolute best value found across the phase(s) 
-            # at a dedicated 'final' step.
+            # ── Capture metrics as user_attrs for post-run analysis ──
+            # pretrain_best_* always populated (from pretrain() or load_pretrain())
+            # best_val_* = current phase best (pretrain or train depending on phase)
+            pretrain_val_loss = trainer.impl.state.pretrain_best_val_loss
+            pretrain_val_acc  = trainer.impl.state.pretrain_best_val_acc
+            train_val_loss    = trainer.impl.state.best_val_loss   # = val_metric
+            train_val_acc     = trainer.impl.state.best_val_acc
+
+            trial.set_user_attr('pretrain_val_loss', float(pretrain_val_loss))
+            trial.set_user_attr('pretrain_val_acc',  float(pretrain_val_acc))
+
+            if self.phase in ('train', 'full'):
+                val_acc_delta = train_val_acc - pretrain_val_acc   # + = improved
+                trial.set_user_attr('train_val_loss', float(train_val_loss))
+                trial.set_user_attr('train_val_acc',  float(train_val_acc))
+                trial.set_user_attr('val_acc_delta',  float(val_acc_delta))
+            else:
+                # phase='pretrain' — train_val_* not applicable
+                val_acc_delta = float('nan')
+
+            # ── Final report for pruner — val_loss only, no penalty ───
             trial.report(val_metric, step=trainer.state.total_steps_run)
-            self._logger.info(f"Trial {trial.number} | Final Summary Step: {trainer.state.total_steps_run} | val_metric={val_metric:.4f}")
+            self._logger.info(
+                f"Trial {trial.number} | Step={trainer.state.total_steps_run} | "
+                f"objective(val_loss)={val_metric:.4f} | "
+                f"pretrain_loss={pretrain_val_loss:.4f} pretrain_acc={pretrain_val_acc:.4f} | "
+                + (f"train_loss={train_val_loss:.4f} train_acc={train_val_acc:.4f} "
+                   f"acc_delta={val_acc_delta:+.4f}"
+                   if self.phase in ('train', 'full') else "pretrain phase only")
+            )
 
         except self._optuna.exceptions.TrialPruned:
             self._logger.info(f"Trial {trial.number} SCUTTLED (Early Exit) via Pruner")
@@ -670,29 +755,253 @@ class HPTuner:
     # Callback
     # ------------------------------------------------------------------
 
+    def _export_visualizations(self, study):
+        """
+        Export Optuna visualizations as HTML files to logs_dir.
+        Requires plotly — silently skipped if not installed.
+
+        Files produced:
+            {run_id}_{study_name}_opt_history.html    — objective per trial
+            {run_id}_{study_name}_param_importance.html — HP importance ranking
+            {run_id}_{study_name}_parallel_coord.html — all HPs vs objective
+            {run_id}_{study_name}_acc_delta.html      — val_acc delta per trial (custom)
+        """
+        try:
+            import optuna.visualization as vis
+            import plotly.graph_objects as go
+
+            prefix = os.path.join(
+                os.path.dirname(self._log_path),
+                f"tuner.{self.run_id}_{self.tune_config.study_name}"
+            )
+
+            # 1. Optimization history — objective per trial
+            try:
+                vis.plot_optimization_history(study).write_html(f"{prefix}_opt_history.html")
+            except Exception as e:
+                self._logger.warning(f"opt_history plot failed: {e}")
+
+            # 2. HP importance ranking
+            try:
+                vis.plot_param_importances(study).write_html(f"{prefix}_param_importance.html")
+            except Exception as e:
+                self._logger.warning(f"param_importance plot failed: {e}")
+
+            # 3. Parallel coordinate — all HPs vs objective
+            try:
+                vis.plot_parallel_coordinate(study).write_html(f"{prefix}_parallel_coord.html")
+            except Exception as e:
+                self._logger.warning(f"parallel_coord plot failed: {e}")
+
+            # 4. Custom — val_acc_delta per trial (key metric for our goal)
+            try:
+                trials  = [t for t in study.trials if t.value is not None]
+                numbers = [t.number for t in trials]
+                deltas  = [t.user_attrs.get('val_acc_delta', float('nan')) for t in trials]
+                p_accs  = [t.user_attrs.get('pretrain_val_acc', float('nan')) for t in trials]
+                tr_accs = [t.user_attrs.get('train_val_acc',    float('nan')) for t in trials]
+
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=numbers, y=deltas,
+                    name='val_acc_delta (train - pretrain)',
+                    marker_color=['green' if d >= 0 else 'red' for d in deltas],
+                ))
+                fig.add_trace(go.Scatter(
+                    x=numbers, y=p_accs,
+                    name='pretrain_val_acc (baseline)',
+                    mode='lines', line=dict(color='blue', dash='dash'),
+                ))
+                fig.add_trace(go.Scatter(
+                    x=numbers, y=tr_accs,
+                    name='train_val_acc',
+                    mode='lines+markers', line=dict(color='orange'),
+                ))
+                fig.add_hline(y=0, line_color='black', line_dash='dot', annotation_text='no degradation')
+                fig.update_layout(
+                    title=f'{self.tune_config.study_name} — val_acc: pretrain vs train per trial',
+                    xaxis_title='Trial', yaxis_title='val_acc',
+                    barmode='overlay',
+                )
+                fig.write_html(f"{prefix}_acc_delta.html")
+            except Exception as e:
+                self._logger.warning(f"acc_delta plot failed: {e}")
+
+            # 5. val_acc vs val_loss scatter — tradeoff view
+            if self.phase in ('train', 'full'):
+                try:
+                    tr_losses = [t.user_attrs.get('train_val_loss', None) for t in trials]
+                    tr_accs   = [t.user_attrs.get('train_val_acc',  None) for t in trials]
+                    p_acc_ref = trials[0].user_attrs.get('pretrain_val_acc', None) if trials else None
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=tr_losses, y=tr_accs,
+                        mode='markers+text',
+                        text=[str(t.number) for t in trials],
+                        textposition='top center',
+                        marker=dict(
+                            size=10,
+                            color=[t.value for t in trials],
+                            colorscale='RdYlGn_r',
+                            colorbar=dict(title='objective'),
+                            showscale=True,
+                        ),
+                        name='trials',
+                    ))
+                    if p_acc_ref is not None:
+                        fig.add_hline(
+                            y=p_acc_ref, line_color='blue', line_dash='dash',
+                            annotation_text=f'pretrain_val_acc={p_acc_ref:.4f}',
+                            annotation_position='right',
+                        )
+                    fig.update_layout(
+                        title=f'{self.tune_config.study_name} — val_acc vs val_loss per trial',
+                        xaxis_title='train_val_loss (lower=better)',
+                        yaxis_title='train_val_acc (higher=better)',
+                    )
+                    fig.write_html(f"{prefix}_acc_vs_loss.html")
+                except Exception as e:
+                    self._logger.warning(f"acc_vs_loss scatter failed: {e}")
+
+            self._logger.info(f"Visualizations exported to {prefix}_*.html")
+            print(f"  Visualizations: {prefix}_*.html")
+
+        except ImportError:
+            self._logger.info("plotly not installed — visualizations skipped")
+
     def _trial_callback(self, study, trial):
-        """Prints concise trial summary after each trial completes."""
+        """Logs per-trial summary — val_loss + val_acc + pretrain baseline + best so far."""
+        if trial.value is None:
+            return
+        pretrain_loss = trial.user_attrs.get('pretrain_val_loss', float('nan'))
+        pretrain_acc  = trial.user_attrs.get('pretrain_val_acc',  float('nan'))
+
+        if self.phase in ('train', 'full'):
+            train_loss = trial.user_attrs.get('train_val_loss', float('nan'))
+            train_acc  = trial.user_attrs.get('train_val_acc',  float('nan'))
+            delta      = trial.user_attrs.get('val_acc_delta',  float('nan'))
+            phase_info = (
+                f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+                f"acc_delta={delta:+.4f} | "
+            )
+        else:
+            phase_info = ""
+
         self._logger.info(
-            f"Trial {trial.number} complete | "
-            f"val={trial.value:.4f} | "
-            f"params={trial.params} | "
-            f"best_so_far={study.best_value:.4f}"
+            f"Trial {trial.number} | "
+            f"objective={trial.value:.4f} | "
+            f"pretrain_loss={pretrain_loss:.4f} pretrain_acc={pretrain_acc:.4f} | "
+            f"{phase_info}"
+            f"best_so_far={study.best_value:.4f} | "
+            f"params={trial.params}"
         )
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
 
-    def print_summary(self):
-        """Prints full tuning results after run() completes."""
+    def print_summary(self, study=None):
+        """
+        Prints full tuning results after run() completes.
+        Logs best trial metrics + all-trial comparison table.
+        Exports styled HTML table to logs_dir for visual inspection.
+        """
         if not self.best_trial:
             print("No trials completed yet. Call run() first.")
             return
-        self._logger.info(f"=== TUNING SUMMARY === study={self.tune_config.study_name}")
-        self._logger.info(f"Best trial: {self.best_trial.number}")
-        self._logger.info(f"Best val:   {self.best_trial.value:.4f}")
+
+        bt            = self.best_trial
+        pretrain_loss = bt.user_attrs.get('pretrain_val_loss', float('nan'))
+        pretrain_acc  = bt.user_attrs.get('pretrain_val_acc',  float('nan'))
+        train_loss    = bt.user_attrs.get('train_val_loss',    float('nan'))
+        train_acc     = bt.user_attrs.get('train_val_acc',     float('nan'))
+        acc_delta     = bt.user_attrs.get('val_acc_delta',     float('nan'))
+
+        self._logger.info(f"")
+        self._logger.info(f"=== TUNING SUMMARY === study={self.tune_config.study_name} ===")
+        self._logger.info(f"  Best trial  : {bt.number}")
+        self._logger.info(f"  Objective   : {bt.value:.4f}  (val_loss — lower is better)")
+        self._logger.info(f"  Pretrain    : val_loss={pretrain_loss:.4f}  val_acc={pretrain_acc:.4f}  (baseline)")
+        if self.phase in ('train', 'full'):
+            self._logger.info(f"  Train       : val_loss={train_loss:.4f}  val_acc={train_acc:.4f}  acc_delta={acc_delta:+.4f}")
         self._logger.info(f"  Best HPs:")
         for group, hps in self.best_hps.items():
             for k, v in (hps or {}).items():
                 self._logger.info(f"      [{group}] {k:20s} : {v}")
+
+        # ── Build all-trials DataFrame ────────────────────────────────
+        if study is None:
+            print(f"  Tuner summary written to {self._log_path}")
+            return
+
+        import pandas as pd
+
+        rows = []
+        # Collect all HP keys in sorted order for consistent columns
+        all_hp_keys = sorted({
+            k for t in study.trials if t.value is not None
+            for k in t.params.keys()
+        })
+
+        for t in sorted(study.trials, key=lambda x: x.number):
+            if t.value is None:
+                continue
+            row = {'trial': t.number}
+            for k in all_hp_keys:
+                row[k] = t.params.get(k, None)
+            row['pretrain_val_loss'] = t.user_attrs.get('pretrain_val_loss', float('nan'))
+            row['pretrain_val_acc']  = t.user_attrs.get('pretrain_val_acc',  float('nan'))
+            if self.phase in ('train', 'full'):
+                row['train_val_loss'] = t.user_attrs.get('train_val_loss', float('nan'))
+                row['train_val_acc']  = t.user_attrs.get('train_val_acc',  float('nan'))
+                row['val_acc_delta']  = t.user_attrs.get('val_acc_delta',  float('nan'))
+            row['objective'] = t.value
+            rows.append(row)
+
+        df = pd.DataFrame(rows).sort_values('objective').reset_index(drop=True)
+
+        # Log plain table
+        self._logger.info('\n' + df.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
+
+        # ── Styled HTML table ─────────────────────────────────────────
+        try:
+            metric_cols = [c for c in ['pretrain_val_loss', 'pretrain_val_acc',
+                                        'train_val_loss', 'train_val_acc',
+                                        'val_acc_delta', 'objective'] if c in df.columns]
+
+            styled = (
+                df.style
+                .format({c: '{:.4f}' for c in metric_cols})
+                .background_gradient(subset=['objective'],    cmap='RdYlGn_r')
+                .background_gradient(subset=['pretrain_val_acc'] if 'pretrain_val_acc' in df.columns else [], cmap='RdYlGn')
+                .background_gradient(subset=['train_val_acc']    if 'train_val_acc'    in df.columns else [], cmap='RdYlGn')
+                .background_gradient(subset=['val_acc_delta']    if 'val_acc_delta'    in df.columns else [], cmap='RdYlGn')
+                .set_caption(
+                    f"Tuner Results — {self.tune_config.study_name} | "
+                    f"phase={self.phase} | best_trial={bt.number}"
+                )
+                .set_table_styles([{
+                    'selector': 'caption',
+                    'props': [('font-size', '14px'), ('font-weight', 'bold'), ('padding', '8px')]
+                }, {
+                    'selector': 'th',
+                    'props': [('background-color', '#2c3e50'), ('color', 'white'),
+                              ('padding', '6px 10px'), ('font-size', '12px')]
+                }, {
+                    'selector': 'td',
+                    'props': [('padding', '5px 10px'), ('font-size', '12px')]
+                }])
+                .highlight_min(subset=['objective'], color='#d4efdf')
+            )
+
+            prefix    = os.path.splitext(self._log_path)[0]
+            html_path = f"{prefix}_trials_table.html"
+            styled.to_html(html_path)
+            self._logger.info(f"Styled HTML table: {html_path}")
+            print(f"  Trials table : {html_path}")
+
+        except Exception as e:
+            self._logger.warning(f"Styled HTML table failed: {e}")
+
         print(f"  Tuner summary written to {self._log_path}")
