@@ -290,7 +290,6 @@ class Plotter:
         # ── Build rows ────────────────────────────────────────────────────
         rows = []
         for run_id, result in runner.run_results.items():
-            ts  = result.training_state
             rs  = result.run_scores
 
             def acc(key, field='top1_acc'):
@@ -324,7 +323,7 @@ class Plotter:
         df = pd.DataFrame(rows)
 
         # ── Highlight helpers ─────────────────────────────────────────────
-        highlight_high = ['Pre Softmax %', 'Pre Novel Seen %', 'Pre Proto Novel %',
+        highlight_high = ['Pre Softmax %', 'Pre Proto Seen %', 'Pre Proto Novel %',
                           'Tr Softmax %', 'Tr Proto Seen %', 'Tr Proto Novel %']
         highlight_low  = ['Time (min)']   # lower is better
 

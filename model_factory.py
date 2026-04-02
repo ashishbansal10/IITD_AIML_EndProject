@@ -1900,6 +1900,11 @@ class CompositeModel(nn.Module):
             groups.append({'params': trainable, 'lr': lr, 'name': alias})
         return groups
 
+    @property
+    def is_trainable(self) -> bool:
+        """True if the model has at least one parameter that requires gradients."""
+        return len(self.trainable_parameters()) > 0
+
     # ------------------------------------------------------------------
     # Component access
     # ------------------------------------------------------------------
@@ -2010,11 +2015,13 @@ class ModelFactory:
     @staticmethod
     def save(model:      CompositeModel,
              path:       str,
-             components: Optional[List[str]] = None):
+             components: Optional[List[str]] = None,
+             metadata:   Optional[Dict] = None):
         """
         Save checkpoint.
         Mathematical components (Softmax, PrototypicalNet) skipped — no state.
         components=None saves all non-mathematical components.
+        metadata= extra dict to save in checkpoint
         """
         os.makedirs(
             os.path.dirname(path) if os.path.dirname(path) else '.',
@@ -2035,17 +2042,17 @@ class ModelFactory:
             'state_dicts':  state_dicts,
             'frozen_names': model.frozen_names(),
             'device':       str(model._device),
+            'metadata':     metadata or {}
         }, path)
 
     @staticmethod
     def load(model:      CompositeModel,
              path:       str,
              components: Optional[List[str]] = None,
-             strict:     bool = True):
+             strict:     bool = True) -> Dict:
         """
         Load checkpoint into existing model.
         components=None loads all saved in checkpoint.
-        [PENDING] Add device consistency check.
         """
         checkpoint  = torch.load(path, map_location=model._device or 'cpu')
         state_dicts = checkpoint.get('state_dicts', {})
@@ -2053,17 +2060,15 @@ class ModelFactory:
 
         for alias in comp_names:
             if alias not in state_dicts:
-                raise KeyError(
-                    f"'{alias}' not in checkpoint. "
-                    f"Available: {list(state_dicts.keys())}"
-                )
-            model.get_component(alias).load_state_dict(
-                state_dicts[alias], strict=strict
-            )
+                raise KeyError(f"'{alias}' not in checkpoint. Available: {list(state_dicts.keys())}")
+
+            model.get_component(alias).load_state_dict(state_dicts[alias], strict=strict)
 
         for frozen_alias in checkpoint.get('frozen_names', []):
             if frozen_alias in model.component_names():
                 model.freeze(frozen_alias)
+
+        return checkpoint
 
     @staticmethod
     def save_backbone(model: CompositeModel, path: str):

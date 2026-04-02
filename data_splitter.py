@@ -1077,6 +1077,7 @@ class TaskCollator:
         'support' : Tensor[N, K, C, H, W],
         'query'   : Tensor[N, Q, C, H, W],
         'target'  : LongTensor[N*Q]  — task-relative labels 0..N-1
+        'global_target' : LongTensor[N*Q]  — original global class IDs (optional)
     }
 
     Args:
@@ -1092,16 +1093,32 @@ class TaskCollator:
         self.q_query = q_query
 
     def __call__(self, batch):
-        imgs     = torch.stack([item[0] for item in batch])
-        reshaped = imgs.view(self.n_way, self.k_shot + self.q_query, *imgs.shape[1:])
-        support  = reshaped[:, :self.k_shot]
-        query    = reshaped[:, self.k_shot:]
+        # Extract Images and Global Labels from the dataset tuples
+        imgs             = torch.stack([item[0] for item in batch])
+        global_targets   = torch.tensor([item[1] for item in batch]) # [N * (K+Q)]
+
+        # Reshape to [N, K+Q, ...] for both images and global labels
+        reshaped_imgs    = imgs.view(self.n_way, self.k_shot + self.q_query, *imgs.shape[1:])
+        reshaped_globals = global_targets.view(self.n_way, self.k_shot + self.q_query)
+
+        # Split into Support and Query sets
+        support  = reshaped_imgs[:, :self.k_shot]
+        query    = reshaped_imgs[:, self.k_shot:]
+
+        # ALIGN GLOBAL LABELS: Match the Trainer's 'torch.cat([support, query])' order
+        # Trainer order: [C1_S1..SK, C2_S1..SK, ..., C1_Q1..QQ, C2_Q1..QQ, ...]
+        support_globals = reshaped_globals[:, :self.k_shot].reshape(-1)
+        query_globals   = reshaped_globals[:, self.k_shot:].reshape(-1)
+        aligned_globals = torch.cat([support_globals, query_globals], dim=0)
+
+        # Task-relative targets (0..N-1) for Prototypical Loss
         target   = torch.arange(self.n_way).repeat_interleave(self.q_query)
 
         return {
             "support": support,
             "query":   query,
-            "target":  target.long()
+            "target":  target.long(),
+            "targets_global": aligned_globals.long() # Safely passed to trainer
         }
 
 

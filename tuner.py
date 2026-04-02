@@ -591,14 +591,6 @@ class HPTuner:
             f"{trial_train_config.episodes_train}tr/{trial_train_config.episodes_val}vl episodes"
         )
 
-        # Determine the step index for the final report to avoid overlapping trainer steps
-        # The 'anchor' is the total number of epochs run
-        if self.phase == 'pretrain':
-            final_report_step = trial_train_config.epochs_pretrain
-        elif self.phase == 'train':
-            final_report_step = trial_train_config.epochs_train
-        else: # phase == 'full'
-            final_report_step = trial_train_config.epochs_pretrain + trial_train_config.epochs_train
 
         # ── Run pretrain or train ─────────────────────────────────────
         TrainerClass = StandardTrainer if self.paradigm == 'standard' else FewShotTrainer
@@ -614,18 +606,17 @@ class HPTuner:
             if self.phase in ['train', 'full']:
                 if self.phase == 'train':
                     self._logger.info(f"Trial {trial.number} | Loading pretrain checkpoint from {self.load_checkpoint_path}")
-                    ModelFactory.load(trial_model, self.load_checkpoint_path)
-                    trainer.impl.state.is_pretrained = True
+                    trainer.load_pretrain(self.load_checkpoint_path)
 
-                self._logger.info(f"Trial {trial.number} | Running Train)")
+                self._logger.info(f"Trial {trial.number} | Running Train")
                 trainer.train(optuna_trial=trial)
                 val_metric = trainer.impl.state.best_val_loss
 
             # ── THE FINAL REPORT (Re-integrated) ──
             # We report the absolute best value found across the phase(s) 
             # at a dedicated 'final' step.
-            trial.report(val_metric, step=final_report_step)
-            self._logger.info(f"Trial {trial.number} | val_metric={val_metric:.4f}")
+            trial.report(val_metric, step=trainer.state.total_steps_run)
+            self._logger.info(f"Trial {trial.number} | Final Summary Step: {trainer.state.total_steps_run} | val_metric={val_metric:.4f}")
 
         except self._optuna.exceptions.TrialPruned:
             self._logger.info(f"Trial {trial.number} SCUTTLED (Early Exit) via Pruner")

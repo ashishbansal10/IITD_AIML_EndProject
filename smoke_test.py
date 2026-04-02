@@ -229,18 +229,18 @@ def run_smoke_test2(loader_factory, device, num_workers=0):
     hybrid_cfg = ModelConfig.hybrid_config(n_classes=n_classes, n_way=5, k_shot=5)
 
     t_cfg = TrainConfig(
-        epochs_pretrain    = 2,
-        epochs_train       = 2,
-        episodes_train     = 5,
-        episodes_val       = 3,
-        batch_size         = 32,
+        epochs_pretrain    = 1,
+        epochs_train       = 1,
+        episodes_train     = 1,
+        episodes_val       = 1,
+        batch_size         = 64,
         num_workers        = num_workers,
     )
 
     eval_cfg = EvalConfig(
         n_episodes_seen=3, n_episodes_novel=5,
         n_way=5, k_shot=5, q_query=15,
-        batch_size=32, num_workers=num_workers,
+        batch_size=64, num_workers=num_workers,
     )
 
     runs = [
@@ -284,7 +284,7 @@ def run_smoke_test2(loader_factory, device, num_workers=0):
 
 def run_smoke_test3(loader_factory, device, num_workers=0):
     """
-    Smoke test 3 — CNN Standard (Lightning + Optuna) + CNN FewShot (PyTorch)
+    Smoke test 3 — CNN Standard (Optuna) + CNN FewShot (PyTorch)
     Verifies: Lightning backend, Optuna proxy, result serialisation.
     Cleans up all disk files on completion.
     """
@@ -302,7 +302,7 @@ def run_smoke_test3(loader_factory, device, num_workers=0):
         epochs_train       = 2,
         episodes_train     = 2,
         episodes_val       = 2,
-        batch_size         = 32,
+        batch_size         = 64,
         num_workers        = num_workers,
     )
 
@@ -312,7 +312,7 @@ def run_smoke_test3(loader_factory, device, num_workers=0):
         n_way=5,
         k_shot=5,
         q_query=15,
-        batch_size=32,
+        batch_size=64,
         num_workers=num_workers,
     )
 
@@ -369,9 +369,9 @@ def run_all_smoke_tests(loader_factory, device, num_workers=0, stop_on_fail=True
     import time
 
     tests = [
-        #('smoke_test0 — data pipeline',   lambda: run_smoke_test0(loader_factory, device, num_workers)),
-        #('smoke_test1 — forward pass',    lambda: run_smoke_test1(loader_factory, device)),
-        #('smoke_test2 — all 6 archs',     lambda: run_smoke_test2(loader_factory, device, num_workers)),
+        ('smoke_test0 — data pipeline',   lambda: run_smoke_test0(loader_factory, device, num_workers)),
+        ('smoke_test1 — forward pass',    lambda: run_smoke_test1(loader_factory, device)),
+        ('smoke_test2 — all 6 archs',     lambda: run_smoke_test2(loader_factory, device, num_workers)),
         ('smoke_test3 — optuna',          lambda: run_smoke_test3(loader_factory, device, num_workers)),
     ]
 

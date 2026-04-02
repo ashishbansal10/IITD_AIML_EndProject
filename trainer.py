@@ -41,10 +41,26 @@ mode='softmax'      → probabilities → NEVER pass to CrossEntropyLoss
 
 device passed from notebook — never auto-detected inside any class.
 
-Required Libraries
-------------------
-# torch>=2.0.0
-# tqdm>=4.0.0               # train phase — pip install tqdm
+TRAINER JOINT LOSS SUITE: LCA & RKD IMPLEMENTATION
+
+This suite provides a modular framework for Joint Loss regularization during
+few-shot episodic training. It aims to preserve the 'Feature Memory' of a 
+pre-trained ResNet12 backbone.
+
+Techniques:
+1. Latent Centroid Anchoring (LCA): 
+   Statistical preservation of class-specific distributions using KL-Divergence.
+   Requires pre-computed mean/variance for the 64 base classes.
+
+2. Relational Knowledge Distillation (RKD):
+   Structural preservation of batch topology (distances between samples) using
+   a frozen Teacher backbone.
+
+Hyperparameters (TrainConfig):
+- joint_loss_alpha_lca: Weight for statistical anchoring.
+- joint_loss_alpha_rkd: Weight for topological preservation.
+- joint_loss_temp: Temperature scaling for RKD distance matrices.
+- joint_loss_lca_var: Softness constant (variance) for student LCA distribution.
 
 Elastic Weight Consolidation (EWC)
 
@@ -75,16 +91,27 @@ alongside weight_decay, not as a replacement.
 
 Reference: Kirkpatrick, J. et al. (2017). Overcoming catastrophic 
 forgetting in neural networks. PNAS, 114(13), 3521–3526.
+
+Required Libraries
+------------------
+# torch>=2.0.0
+# tqdm>=4.0.0               # train phase — pip install tqdm
+
 """
 
 import os
 import time
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import copy
+import random
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any, Tuple
 from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal, kl_divergence
 
 
 # ==============================================================================
@@ -115,23 +142,60 @@ class TrainConfig:
     # ExperimentRunner decides what to keep based on exec_config flags.
 
     # ── Core ──────────────────────────────────────────────────────────
-    lr:                   float = 1e-3
     epochs_pretrain:      int   = 100
     epochs_train:         int   = 100
+    lr:                   float = 5e-4
 
     # ── Scheduler ─────────────────────────────────────────────────────
-    scheduler:            str   = 'step'     # 'step', 'cosine', 'none'
+    scheduler:            str   = 'cosine'     # 'step', 'cosine', 'none'
     lr_decay_step:        int   = 20
     lr_decay_gamma:       float = 0.5
 
     # ── Regularization ────────────────────────────────────────────────
     weight_decay:         float = 1e-4              # ← L2 regularisation — penalty on weight magnitude
-    label_smoothing:      float = 0.1
+    label_smoothing:      float = 0.0
     grad_clip:            Optional[float] = None    # None = disabled
 
     # ── Early stopping ────────────────────────────────────────────────
-    early_stop_patience:  int   = 10
+    early_stop_patience:  int   = 25
     early_stop_metric:    str   = 'val_loss'   # 'val_loss' or 'val_acc'
+
+    # ── Optimizer ─────────────────────────────────────────────────────
+    # Per-component lr override for trainable_param_groups
+    # e.g. {'backbone': 1e-4, 'linear': 1e-3}
+    lr_map:               Optional[Dict[str, float]] = None
+
+    # ── Train phase improvements (all default to disabled = current behaviour) ──
+    ewc_lambda:       float = 0.0    # EWC penalty weight — 0.0 = disabled
+    freeze_n_epochs:  int   = 0      # freeze backbone's first N train epochs — 0 = disabled
+    warm_start:       bool  = False  # init train early-stop from pretrain best — False = reset
+
+
+    # ── Joint loss regularization (LCA + RKD) ─────────────────────────
+
+    # Joint Loss Alpha "Dials" (0.0 = Off)
+
+    #   joint_loss_alpha_lca: [0.1 - 1.0] 
+    #   -> Weight for statistical identity. Start at 0.5; higher values enforce stricter class-identity preservation.
+    joint_loss_alpha_lca: float = 0.0    
+
+    #   joint_loss_alpha_rkd: [0.1 - 1.0] 
+    #   -> Weight for structural topology. Distills relative distances between samples.
+    #       Highly effective for GAT relational learning.
+    joint_loss_alpha_rkd: float = 0.0    
+
+    # Stability Hyperparameters
+
+    # joint_loss_temp: [1.0 - 5.0] 
+    #   -> RKD Temperature. Higher values (e.g., 2.0) smooth the distance matrix,
+    #       making the topology more flexible for novel tasks.
+    joint_loss_temp:      float = 1.0    
+
+    # joint_loss_lca_var: [0.01 - 0.2] 
+    #   -> Student neighborhood variance. Lower values (0.01) make the student 
+    #      anchoring "sharp"; higher values (0.1) allow more feature exploration.
+    joint_loss_lca_var:   float = 0.1
+
 
     # ── Episodic protocol ─────────────────────────────────────────────
     n_way:                int   = 5
@@ -147,17 +211,6 @@ class TrainConfig:
     # ── Verbose ───────────────────────────────────────────────────────
     verbose: bool = True   # True = print every epoch + tqdm (smoke/debug)
                            # False = phase summary only (real experiment runs)
-
-    # ── Optimizer ─────────────────────────────────────────────────────
-    # Per-component lr override for trainable_param_groups
-    # e.g. {'backbone': 1e-4, 'linear': 1e-3}
-    lr_map:               Optional[Dict[str, float]] = None
-
-    # ── Train phase improvements (all default to disabled = current behaviour) ──
-    ewc_lambda:       float = 0.0    # EWC penalty weight — 0.0 = disabled
-    freeze_n_epochs:  int   = 0      # freeze backbone first N train epochs — 0 = disabled
-    joint_loss_alpha: float = 0.0    # KL embedding anchor weight — 0.0 = disabled
-    warm_start:       bool  = False  # init train early-stop from pretrain best — False = reset
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -238,6 +291,7 @@ class TrainingState:
 
     # Current epoch
     epoch:                int   = 0
+    total_steps_run:      int   = 0     # Added: Continuous step for Optuna tracking across phases
 
     # Best validation metrics — tracked for early stopping + checkpointing
     pretrain_best_val_loss: float = float('inf')
@@ -260,16 +314,32 @@ class TrainingState:
     is_pretrained:        bool  = False
     is_trained:           bool  = False
 
-    # Runtime tensors — populated during training, excluded from JSON serialization
-    pretrain_emb_mean:    Any   = field(default=None, repr=False)  # [D] — KL joint loss reference
-    pretrain_emb_var:     Any   = field(default=None, repr=False)  # [D] — KL joint loss reference
+    # EWC - Runtime tensors — populated during training, excluded from JSON serialization
     fisher_diag:          Any   = field(default=None, repr=False)  # dict{name: tensor} — EWC Fisher
     pretrain_weights:     Any   = field(default=None, repr=False)  # dict{name: tensor} — EWC reference
 
+    # LCA Anchors: Only store the raw tensors for checkpointing 
+    # (Latent Centroid Anchoring - class wide mean/variance for KL divergence)
+    # Shape: [90, 640]
+    class_means: Optional[torch.Tensor] = None 
+    class_vars:  Optional[torch.Tensor] = None
+
     def to_dict(self) -> dict:
+        # 1. Deep copy of the state into a dictionary
         d = asdict(self)
-        for key in ('pretrain_emb_mean', 'pretrain_emb_var', 'fisher_diag', 'pretrain_weights'):
-            d.pop(key, None)  # remove tensors from dict for JSON serialization
+        
+        # 2. List of keys that contain Tensors (Non-JSON serializable)
+        tensor_keys = (
+            'fisher_diag', 
+            'pretrain_weights', 
+            'class_means',   # Added for LCA
+            'class_vars'     # Added for LCA
+        )
+        
+        # 3. Strip them out for the JSON-safe return
+        for key in tensor_keys:
+            d.pop(key, None)
+            
         return d
 
     def reset_early_stop(self):
@@ -330,6 +400,173 @@ class TrainingHistory:
 
 
 # ==============================================================================
+# JointLossManager — LCA + RKD implementation
+#   LCA: Statistical preservation of class-specific distributions using KL-Divergence.
+#   RKD: Structural preservation of batch topology (distances between samples) using a frozen Teacher backbone.
+# ==============================================================================
+
+class JointLossManager:
+    """
+    Surgical Suite for Knowledge Retention via Hybrid Regularization (LCA + RKD).
+
+    TERMINOLOGY:
+    -----------
+    - Teacher (T):  A frozen, deep-copied instance of the pre-trained backbone. 
+                    It represents the 'Topological Gold Standard' of the 64-dim base feature space.
+    - Student (S):  The active model instance (Backbone + GAT) within the Trainer 
+                    that is currently being optimized for novel episodic tasks.
+
+    LOSS FUNCTIONS & MECHANICS:
+    --------------------------
+    1. Latent Centroid Anchoring (LCA):
+        - Goal: Preserves categorical 'Identity.'
+        - Computation: Uses KL-Divergence to anchor Student embeddings to the 
+           pre-trained Gaussian distribution (mu, var) of its original class.
+        - mu and var are retrieved from the TrainingState's class_means and class_vars tensors,
+          which are populated after pretraining by computing the mean and variance of the backbone's 
+          feature space for each of the n_classes trained.
+        - mu : [n_classes, 640] tensor of class means
+        - var: [n_classes, 640] tensor of class variances
+        - Formula: Loss_LCA = KL(Normal(mu_s, sigma^2_s) || Normal(mu_t, sigma^2_t))
+
+    2. Relational Knowledge Distillation (RKD):
+        - Goal: Preserves structural 'Topology.'
+        - Computation: Calculates the Mean Squared Error between the normalized 
+          pairwise distance matrices of the Student and Teacher embeddings.
+        - Formula: Loss_RKD = MSE(D_{student}, D_{teacher}) 
+          where D is a mean-normalized distance matrix.
+
+    HYPERPARAMETERS:
+    ---------------
+    - joint_loss_alpha_lca: Weight for statistical anchoring.
+    - joint_loss_alpha_rkd: Weight for topological preservation.
+    - joint_loss_temp: Temperature scaling for RKD distance matrices.
+    - joint_loss_lca_var: Softness constant (variance) for student LCA distribution.
+
+    TOTAL OBJECTIVE:
+    ---------------
+    The combined auxiliary loss is integrated into the episodic optimization:
+    Loss_total = Loss_task + joint_loss_alpha_lca * Loss_LCA + joint_loss_alpha_rkd * Loss_RKD
+
+    SYSTEM INTERACTION:
+    ------------------
+    - TrainConfig: Provides the 'Mixing Board' (alphas) and stability hyperparameters 
+      (temperature, student variance).
+    - TrainingState: Acts as the data persistence layer. It stores the serializable 
+      [n_classes, 640] anchor tensors (means/vars) for LCA.
+    - TrainingImpl: The orchestration layer. It instantiates the Manager, triggers 
+      'initialize()' to clone the Teacher, and delegates 'compute_loss()' during 
+      the training loop.
+
+    Note: To save VRAM, the Teacher is only the Backbone component, not the full model.
+    """
+    def __init__(self, config, device):
+        self.config = config
+        self.device = device
+        self.teacher_backbone = None
+
+    def initialize(self, model):
+        """
+        Clones the backbone component for RKD teacher-student distillation.
+        Uses factory-pattern 'get_component' and custom 'freeze' API.
+        """
+        if self.config.joint_loss_alpha_rkd > 0:
+            # Safely extract backbone via factory method
+            backbone_source = model.get_component('backbone')
+            
+            # Deepcopy to create a distinct Teacher instance
+            self.teacher_backbone = copy.deepcopy(backbone_source)
+            
+            # Use your custom API to disable gradients
+            self.teacher_backbone.freeze() 
+            
+            # Ensure it's in eval mode for inference stability
+            self.teacher_backbone.eval()
+            self.teacher_backbone.to(self.device)
+
+    def compute_loss(self,
+                     images:      torch.Tensor,    # [B, 3, H, W]
+                     embeddings:  torch.Tensor,    # [B, 640]
+                     state_means: torch.Tensor, 
+                     state_vars: torch.Tensor, 
+                     targets: torch.Tensor) -> torch.Tensor:
+        """
+        Aggregates active joint losses based on alpha configuration.
+
+        Args:
+            embeddings (torch.Tensor): Active student features $[B, 640]$ currently being optimized.
+            state_means (torch.Tensor): Global class centroids $[90, 640]$ retrieved from pre-training.
+            state_vars (torch.Tensor): Global class variances $[90, 640]$ defining anchor distribution width.
+            targets (torch.Tensor): Original global class indices (0-89) used to index class-specific anchors.
+
+        Returns:
+            torch.Tensor: Weighted sum of LCA and RKD auxiliary losses.
+        """
+        loss = torch.tensor(0.0, device=self.device)
+
+        # 1. Latent Centroid Anchoring (LCA)
+        if self.config.joint_loss_alpha_lca > 0 and targets is not None:
+            # Identify samples with non-zero anchors (variances were clamped to 1e-6)
+            # targets indices the [N, D] tensor; sum across D to check for presence
+            valid_mask = state_vars[targets].abs().sum(dim=1) > 0 
+
+            if valid_mask.any():
+                # Compute KL only on the subset of valid anchors
+                kl_loss = self._lca_kl(
+                    embeddings[valid_mask],
+                    state_means[targets[valid_mask]],
+                    state_vars[targets[valid_mask]]
+                )
+                loss += self.config.joint_loss_alpha_lca * kl_loss
+
+
+        # 2. Relational Knowledge Distillation (RKD)
+        if self.config.joint_loss_alpha_rkd > 0 and self.teacher_backbone is not None:
+            loss += self.config.joint_loss_alpha_rkd * self._rkd_dist(images, embeddings)
+
+        return loss
+
+    def _lca_kl(self, embeddings, means, vars):
+        """
+        Calculates KL-Divergence using masked/pre-indexed tensors.
+        
+        Args:
+            embeddings: Student features [Masked_Batch, Feat_Dim]
+            means:      Teacher centroids [Masked_Batch, Feat_Dim]
+            vars:       Teacher variances [Masked_Batch, Feat_Dim]
+        """
+        # Target Distribution (P): Frozen Teacher Anchors
+        std_t = vars.sqrt()
+        p = Normal(means, std_t) 
+        
+        # Student Distribution (Q): Active Features
+        # Uses the 'softness' variance from config
+        std_s = torch.ones_like(embeddings) * (self.config.joint_loss_lca_var ** 0.5) 
+        q = Normal(embeddings, std_s) 
+        
+        # Returns the average KL divergence for the valid samples
+        return kl_divergence(q, p).mean()
+
+    def _rkd_dist(self, images, embeddings):
+        """Preserves distance-wise topology using scale-invariant RKD."""
+        with torch.no_grad():
+            t_emb = self.teacher_backbone(images)
+
+        # Compute Pairwise Euclidean Distance Matrices [B, B]
+        # Entry [i, j] is the distance between sample i and sample j
+        d_s = torch.cdist(embeddings, embeddings, p=2)
+        d_t = torch.cdist(t_emb, t_emb, p=2)
+
+        # Scale-Invariant Normalization (Mean = 1.0)
+        # Mean-Normalization for Scale Invariance
+        # Ensures Student is penalized for shape change, not absolute coordinate scale
+        d_s_norm = d_s / (d_s.mean() * self.config.joint_loss_temp + 1e-7)
+        d_t_norm = d_t / (d_t.mean() * self.config.joint_loss_temp + 1e-7)
+
+        return F.mse_loss(d_s_norm, d_t_norm)
+
+
+# ==============================================================================
 # TrainerImpl — all actual training logic
 # ==============================================================================
 
@@ -338,8 +575,11 @@ class TrainerImpl:
     All actual training logic.
     Not used directly — accessed via StandardTrainer or FewShotTrainer.
 
+    Uses JointLossManager for LCA + RKD regularization loss during episodic training.
+
     Backend dispatch:
         pretrain()        → _pretrain_pytorch()
+        load_pretrain()
         train_batch()     → _run_train_pytorch()
         train_episodic()  → _run_train_pytorch()
 
@@ -365,12 +605,9 @@ class TrainerImpl:
         trainer.impl.state.best_val_loss   → Optuna objective
         trainer.impl.history               → for plotting
     """
-    def __init__(self,
-                 model,
-                 factory,
-                 config:    TrainConfig,
-                 device:    torch.device,
-                 paradigm:  str):
+
+    def __init__(self, model, factory, config:   TrainConfig, device:   torch.device,
+                 paradigm: str, seed: int = 42):
         """
         Args:
             model    : CompositeModel instance
@@ -384,6 +621,7 @@ class TrainerImpl:
         self.config   = config
         self.device   = device
         self.paradigm = paradigm
+        self._seed = seed
 
         # Validate backend combination upfront — before any training starts
         self.config.validate_config()
@@ -400,8 +638,11 @@ class TrainerImpl:
         # Never stored in TrainingState — TrainingState holds only export paths.
         self._pretrain_best_path: str = ''
         self._train_best_path:    str = ''
-        self._phase_start_time: float = 0.0   # wall clock per phase
+        self._phase_start_time: float = 0.0   # wall clock time per phase
         self._best_epoch:       int   = 0     # epoch where best checkpoint was saved
+
+        # Joint loss manager for LCA + RKD regularization during episodic training
+        self.joint_loss_manager = JointLossManager(config, device)
 
         self.validate()
 
@@ -464,20 +705,61 @@ class TrainerImpl:
 
         self._pretrain_pytorch(optuna_trial=optuna_trial)
 
-        self.model.unfreeze('prototypical')
-
         # Restore best-pretrain-epoch weights before returning.
         # Caller (runner) receives model already at best state — no load_best() needed.
         self._load_pretrain_best()
-        self.state.is_pretrained = True
+        self.model.unfreeze('prototypical')
+        self.model.to(self.device)
 
-        # Compute reference stats for train phase improvements (only if enabled)
-        if self.config.joint_loss_alpha > 0:
-            mean, var = self._compute_emb_stats()
-            self.state.pretrain_emb_mean = mean
-            self.state.pretrain_emb_var  = var
+        # Initialize LCA Anchors
+        # Compute anchors (reference stats) for train phase improvements (only if enabled)
+        if self.config.joint_loss_alpha_lca > 0:
+            # Compute per-class means and variances for LCA anchoring
+            means, vars = self._compute_lca_stats()
+            self.state.class_means = means
+            self.state.class_vars  = vars
+
+        # Initialize EWC Fisher
         if self.config.ewc_lambda > 0:
             self._compute_fisher()
+
+
+    def load_pretrain(self, path: str):
+        """
+        Gateway API: Loads pre-trained weights and initializes 
+
+        path: str — checkpoint path to load from (must exist)
+        """
+        from model_factory import ModelFactory
+        
+        if not path or not os.path.exists(path):
+            raise FileNotFoundError(f"load_pretrain: Checkpoint not found at {path}")
+
+        # Load weights into model
+        checkpoint = ModelFactory.load(self.model, path)
+        meta = checkpoint.get('metadata', {})
+
+        # Rehydrate Historical Metrics and Flags
+        self.state.pretrain_best_val_loss = meta.get('val_loss', float('inf'))
+        self.state.pretrain_best_val_acc  = meta.get('val_acc', 0.0)
+        self.state.pretrain_export_path   = path
+        self.state.is_pretrained          = True
+
+        # Reset Phase 1 masks to 'Neutral'
+        self.model.unfreeze('prototypical')
+        self.model.to(self.device)
+
+        # Initialize LCA Anchors if missing
+        if self.config.joint_loss_alpha_lca > 0 and self.state.class_means is None:
+            means, vars = self._compute_lca_stats()
+            self.state.class_means, self.state.class_vars = means, vars
+
+        # Initialize EWC Fisher if missing
+        if self.config.ewc_lambda > 0 and self.state.fisher_diag is None:
+            self._compute_fisher()
+
+        print(f"\n  Phase 1: Pretrain weights loaded from {path}")
+
 
     def train_batch(self, val_pool: str = 'val_seen', optuna_trial=None):
         """
@@ -487,12 +769,11 @@ class TrainerImpl:
         self.state.reset_early_stop()
         self.state.epoch = 0
 
-        if self.config.warm_start:
-            self.state.best_val_loss = self.state.pretrain_best_val_loss
-            self.state.best_val_acc  = self.state.pretrain_best_val_acc
-
         print(f"\n  Phase 2: Train [standard | pytorch | {self.config.epochs_train} epochs]")
+        
+        self.joint_loss_manager.initialize(self.model) # Snapshot Teacher
 
+        self.model.unfreeze_all()
         self.model.freeze('prototypical')
 
         self._run_train_pytorch(
@@ -502,11 +783,11 @@ class TrainerImpl:
             optuna_trial=optuna_trial
         )
 
-        self.model.unfreeze('prototypical')
-
         # Restore best-train-epoch weights before returning.
         self._load_train_best()
-        self.state.is_trained = True
+        self.model.unfreeze('prototypical')
+        self.model.to(self.device)
+
 
     def train_episodic(self, val_pool: str = 'val_unseen', optuna_trial=None):
         """
@@ -518,11 +799,14 @@ class TrainerImpl:
         self.state.reset_early_stop()
         self.state.epoch = 0
 
-        if self.config.warm_start:
-            self.state.best_val_loss = self.state.pretrain_best_val_loss
-            self.state.best_val_acc  = self.state.pretrain_best_val_acc
+        print(f"\n  Phase 2: Train [fewshot | episodic | pytorch | {self.config.episodes_train} eps/epoch | {self.config.epochs_train} epochs]")
 
-        print(f"\n  Phase 2: Train [fewshot | pytorch | {self.config.episodes_train} eps/epoch | {self.config.epochs_train} epochs]")
+        self.joint_loss_manager.initialize(self.model) # Snapshot Teacher
+
+        # Ensure prototypical path unfrozen for episodic training 
+        # Since prototypical path is frozen during pretrain, and checkpointed with frozen names 
+        # Must unfreeze here to allow episodic training to update backbone via prototypical loss
+        self.model.unfreeze_all()
 
         # Freeze linear head — episodic training does not update it
         self.model.freeze('linear')
@@ -535,17 +819,16 @@ class TrainerImpl:
             optuna_trial=optuna_trial
         )
 
-        # Unfreeze for evaluation
-        self.model.unfreeze('linear')
-        self.model.unfreeze('softmax')
-
         # Restore best-train-epoch weights before returning.
         # Note: checkpoint was saved with linear frozen. ModelFactory.load()
         # restores frozen_names from checkpoint — linear will be frozen again.
         # This is correct: fewshot eval uses prototypical path, not linear.
         # Softmax eval uses pretrain-era linear weights — intentional diagnostic.
         self._load_train_best()
-        self.state.is_trained = True
+        self.model.unfreeze('linear')
+        self.model.unfreeze('softmax')
+        self.model.to(self.device)
+
 
     # ------------------------------------------------------------------
     # PyTorch — pretrain
@@ -558,7 +841,7 @@ class TrainerImpl:
 
         pretrain_loader = self.factory.get_loader(
             'pretrain', mode='batch',
-            batch_size  = self.config.batch_size,
+            batch_size = self.config.batch_size,
             num_workers = self.config.num_workers
         )
         val_loader = self.factory.get_loader(
@@ -586,7 +869,7 @@ class TrainerImpl:
 
             # --- INSERTED CODE START for Optuna ---
             if optuna_trial is not None:
-                optuna_trial.report(val_loss, step=epoch)
+                optuna_trial.report(val_loss, step=self.state.total_steps_run)
                 if optuna_trial.should_prune():
                     import optuna
                     raise optuna.TrialPruned()
@@ -601,6 +884,8 @@ class TrainerImpl:
                 self.state.early_stop_counter = 0
             else:
                 self.state.early_stop_counter += 1
+
+            self.state.total_steps_run += 1
 
             if self._early_stopping_check():
                 if self.config.verbose:
@@ -655,6 +940,23 @@ class TrainerImpl:
                 num_workers = self.config.num_workers
             )
 
+        # ── THE ZERO-SHOT ANCHOR for warm_start ──────────────────────
+        if self.config.warm_start:
+            if self.config.verbose:
+                mode_label = 'episodic' if episodic else 'batch'
+                print(f"  Establishing Zero-Shot Anchor via {mode_label} validation...")
+            
+            # Run ONE full validation pass to establish the REAL baseline
+            v_loss, v_acc = self._episodic_epoch(loader=val_loader, optimizer=None, is_train=False) if episodic else \
+                            self._batch_epoch(loader=val_loader, optimizer=None, is_train=False)
+
+            # Calibrate best metrics to this actual starting state
+            self.state.best_val_loss = v_loss
+            self.state.best_val_acc  = v_acc
+            
+            print(f"  warm_start Anchor set: val_loss={v_loss:.4f} val_acc={v_acc:.4f}")
+        # ─────────────────────────────────────────────────────────────
+
         mode_str = 'episodic' if episodic else 'batch'
         unit_str = f"{self.config.episodes_train} eps/epoch" if episodic else "batch"
 
@@ -679,11 +981,11 @@ class TrainerImpl:
                 if hasattr(train_loader.batch_sampler, 'set_epoch'):
                     train_loader.batch_sampler.set_epoch(epoch)
 
-                train_loss, train_acc = self._episodic_epoch(train_loader, optimizer, is_train=True)
-                val_loss, val_acc = self._episodic_epoch(val_loader, optimizer=None, is_train=False)
+                train_loss, train_acc = self._episodic_epoch(loader=train_loader, optimizer=optimizer, is_train=True)
+                val_loss, val_acc = self._episodic_epoch(loader=val_loader, optimizer=None, is_train=False)
             else:
-                train_loss, train_acc = self._batch_epoch(train_loader, optimizer, is_train=True)
-                val_loss, val_acc = self._batch_epoch(val_loader, optimizer=None, is_train=False)
+                train_loss, train_acc = self._batch_epoch(loader=train_loader, optimizer=optimizer, is_train=True)
+                val_loss, val_acc = self._batch_epoch(loader=val_loader, optimizer=None, is_train=False)
 
             if scheduler is not None:
                 scheduler.step()
@@ -694,7 +996,7 @@ class TrainerImpl:
 
             # --- INSERTED CODE START for Optuna ---
             if optuna_trial is not None:
-                optuna_trial.report(val_loss, step=epoch)
+                optuna_trial.report(val_loss, step=self.state.total_steps_run)
                 if optuna_trial.should_prune():
                     import optuna
                     raise optuna.TrialPruned()
@@ -709,6 +1011,8 @@ class TrainerImpl:
                 self.state.early_stop_counter   = 0
             else:
                 self.state.early_stop_counter += 1
+
+            self.state.total_steps_run += 1
 
             if self._early_stopping_check():
                 if self.config.verbose:
@@ -729,24 +1033,21 @@ class TrainerImpl:
     # PyTorch — single epoch loops
     # ------------------------------------------------------------------
 
-    def _batch_epoch(self,
-                     loader,
-                     optimizer,
-                     is_train: bool) -> Tuple[float, float]:
+    def _batch_epoch(self, loader, optimizer, is_train: bool) -> Tuple[float, float]:
         """
         Single batch epoch — train or eval.
         Returns (avg_loss, avg_acc).
         """
+        should_optimize = is_train and self.model.is_trainable
+
         self.model.train() if is_train else self.model.eval()
         total_loss = 0.0
         total_acc  = 0.0
         n_batches  = 0
 
-        ctx = torch.enable_grad() if is_train else torch.no_grad()
+        ctx = torch.enable_grad() if should_optimize else torch.no_grad()
         with ctx:
-            pbar = tqdm(loader, leave=False,
-                        desc=f"  {'train' if is_train else 'val  '}",
-                        disable=not self.config.verbose)
+            pbar = tqdm(loader, leave=False, desc=f"  {'train' if is_train else 'val  '}", disable=not self.config.verbose)
             for imgs, labels in pbar:
                 imgs   = imgs.to(self.device)
                 labels = labels.to(self.device)
@@ -758,48 +1059,52 @@ class TrainerImpl:
                 # NEVER pass softmax output here — double softmax = wrong gradients
                 loss = self._criterion(logits, labels)
 
-                if is_train:
+                if should_optimize:
                     if self.config.ewc_lambda > 0:
-                        loss = loss + self.config.ewc_lambda * self._ewc_penalty()
-                    if self.config.joint_loss_alpha > 0:
-                        emb  = self.model(imgs, mode='embedding')
-                        loss = loss + self.config.joint_loss_alpha * self._compute_kl_loss(emb)
+                        loss += self.config.ewc_lambda * self._ewc_penalty()
+
+                    if self.config.joint_loss_alpha_lca > 0 or self.config.joint_loss_alpha_rkd > 0:
+                        emb = self.model(imgs, mode='embedding')
+                        loss += self.joint_loss_manager.compute_loss(
+                            images=imgs,
+                            embeddings=emb,
+                            state_means=self.state.class_means,
+                            state_vars=self.state.class_vars,
+                            targets=labels
+                        )
+
                     optimizer.zero_grad()
                     loss.backward()
                     if self.config.grad_clip is not None:
-                        nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.config.grad_clip
-                        )
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
                     optimizer.step()
 
                 acc = (logits.argmax(1) == labels).float().mean().item()
                 total_loss += loss.item()
                 total_acc  += acc
                 n_batches  += 1
-                pbar.set_postfix({'loss': f'{loss.item():.4f}',
-                                   'acc':  f'{acc:.4f}'})
+
+                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc':  f'{acc:.4f}'})
 
         return total_loss / max(n_batches, 1), total_acc / max(n_batches, 1)
 
-    def _episodic_epoch(self,
-                        loader,
-                        optimizer,
-                        is_train: bool) -> Tuple[float, float]:
+
+    def _episodic_epoch(self, loader, optimizer, is_train: bool) -> Tuple[float, float]:
         """
         Single episodic epoch — train or eval.
         Each batch is a TaskCollator dict {support, query, target}.
         Returns (avg_loss, avg_acc).
         """
+        should_optimize = is_train and self.model.is_trainable
+
         self.model.train() if is_train else self.model.eval()
         total_loss = 0.0
         total_acc  = 0.0
         n_episodes = 0
 
-        ctx = torch.enable_grad() if is_train else torch.no_grad()
+        ctx = torch.enable_grad() if should_optimize else torch.no_grad()
         with ctx:
-            pbar = tqdm(loader, leave=False,
-                        desc=f"  {'train' if is_train else 'val  '}",
-                        disable=not self.config.verbose)
+            pbar = tqdm(loader, leave=False, desc=f"  {'train' if is_train else 'val  '}", disable=not self.config.verbose)
             for batch in pbar:
                 support = batch['support'].to(self.device)  # [N, K, C, H, W]
                 query   = batch['query'].to(self.device)    # [N, Q, C, H, W]
@@ -813,6 +1118,7 @@ class TrainerImpl:
                 # graph — cross-group edges allow support→query info flow.
                 # For CNN/GNN runs: no difference — each image is processed
                 # independently by the backbone regardless of order.
+
                 episode = torch.cat([
                     support.reshape(N * K, C, H, W),
                     query.reshape(N * Q, C, H, W)
@@ -825,22 +1131,32 @@ class TrainerImpl:
 
                 # Prototypical distances
                 # CrossEntropyLoss on distances — safe, no softmax involved
-                dists = self.model( support_emb=s_emb, query_emb=q_emb, mode='prototypical' )   # [N*Q, N]
+                dists = self.model(support_emb=s_emb, query_emb=q_emb, mode='prototypical')   # [N*Q, N]
 
                 loss = self._criterion(dists, target)
 
-                if is_train:
+                if should_optimize:
                     if self.config.ewc_lambda > 0:
-                        loss = loss + self.config.ewc_lambda * self._ewc_penalty()
-                    if self.config.joint_loss_alpha > 0:
-                        # all_emb already computed above — reuse for KL anchor
-                        loss = loss + self.config.joint_loss_alpha * self._compute_kl_loss(all_emb)
+                        loss += self.config.ewc_lambda * self._ewc_penalty()
+
+                    if self.config.joint_loss_alpha_lca > 0 or self.config.joint_loss_alpha_rkd > 0:
+                        # Retrieve the aligned global IDs from our new Collator logic
+                        global_ids = batch.get('targets_global', None)
+
+                        # Compute regularized loss
+                        # Manager handles the 'Masked Drop' of sparse classes internally
+                        loss += self.joint_loss_manager.compute_loss(
+                            images      = episode,
+                            embeddings  = all_emb, 
+                            state_means = self.state.class_means, 
+                            state_vars  = self.state.class_vars, 
+                            targets     = global_ids.to(self.device) if global_ids is not None else None
+                        )
+
                     optimizer.zero_grad()
                     loss.backward()
                     if self.config.grad_clip is not None:
-                        nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.config.grad_clip
-                        )
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
                     optimizer.step()
 
                 acc = (dists.argmax(1) == target).float().mean().item()
@@ -916,34 +1232,87 @@ class TrainerImpl:
         return False
 
     def _save_checkpoint(self, path: str):
-        """Internal — save full model during training loop on improvement."""
+        """
+        Internal — save full model during training loop on improvement.
+        Metadata is passed to ModelFactory.save for Phase 2 rehydration.
+        """
         from model_factory import ModelFactory
-        ModelFactory.save(self.model, path)
+
+        metadata = {
+            'val_loss': self.state.best_val_loss,
+            'val_acc':  self.state.best_val_acc,
+            'epoch':    self.state.epoch
+        }
+        ModelFactory.save(self.model, path, metadata=metadata)
 
     # ------------------------------------------------------------------
     # Train phase improvement helpers
     # ------------------------------------------------------------------
 
-    def _compute_emb_stats(self):
+    def _compute_lca_stats(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass over val_seen — compute backbone embedding mean and var.
-        Called once at end of pretrain() when joint_loss_alpha > 0.
-        Returns (mean [D], var [D]) as detached CPU tensors.
+        Computes LCA anchors using a 1:1 balanced ratio of Pretrain and Val_seen data.
+        Dynamically infers feature dimensions and uses self._seed for reproducibility.
         """
-        loader = self.factory.get_loader(
-            'val_seen', mode='batch',
-            batch_size  = self.config.batch_size,
-            num_workers = self.config.num_workers
-        )
         self.model.eval()
-        all_embs = []
-        with torch.no_grad():
-            for imgs, _ in loader:
-                imgs = imgs.to(self.device)
-                emb  = self.model(imgs, mode='embedding')
-                all_embs.append(emb.cpu())
-        all_embs = torch.cat(all_embs, dim=0)   # [N, D]
-        return all_embs.mean(0).to(self.device), all_embs.var(0).to(self.device)
+        class_data = defaultdict(list)
+        
+        # 1. Collect features from both base-class pools
+        # pretrain = 40% (memorization), val_seen = 20% (generalization)
+        for pool in ['pretrain', 'val_seen']:
+            loader = self.factory.get_loader(pool, mode='batch', shuffle=False)
+            with torch.no_grad():
+                for imgs, labels in loader:
+                    emb = self.model(imgs.to(self.device), mode='embedding')
+                    # Move to CPU immediately to preserve A100 VRAM
+                    for i in range(len(labels)):
+                        class_data[labels[i].item()].append((emb[i].cpu(), pool))
+
+        # 2. Dynamic Architecture Discovery
+        if not class_data:
+            raise RuntimeError("LCA Stats: No data collected from pretrain/val_seen pools.")
+
+        # Infer feat_dim from the first collected embedding
+        any_class_samples = next(iter(class_data.values()))
+        feat_dim = any_class_samples[0][0].shape[0] 
+        
+        # Determine max class index (supports 90 classes or more)
+        num_classes = int(max(class_data.keys()) + 1)
+
+        means = torch.zeros(num_classes, feat_dim)
+        vars = torch.zeros(num_classes, feat_dim)
+        
+        # Seeded RNG for reproducible sub-sampling
+        rng = random.Random(self._seed)
+
+        # 3. 1:1 Balanced Computation
+        active_anchors = 0
+        for c, samples in class_data.items():
+            # Drop strategy: skip classes with total samples < 5
+            if len(samples) < 5:
+                continue
+
+            p_samples = [s[0] for s in samples if s[1] == 'pretrain']
+            v_samples = [s[0] for s in samples if s[1] == 'val_seen']
+            
+            # Determine the pivot size (usually limited by the smaller val_seen pool)
+            min_size = min(len(p_samples), len(v_samples))
+            
+            if min_size > 0:
+                # Sub-sample pretrain to match val_seen count (ensures 1:1 weight)
+                rng.shuffle(p_samples)
+                balanced_feat = torch.stack(v_samples + p_samples[:min_size])
+            else:
+                # Fallback for edge cases where a class is missing from one pool
+                balanced_feat = torch.stack([s[0] for s in samples])
+
+            # Calculate Gaussian parameters for the class
+            means[c] = balanced_feat.mean(0)
+            vars[c] = balanced_feat.var(0).clamp(min=1e-6) # Numerical stability guard
+            active_anchors += 1
+
+        print(f"  LCA: Computed {active_anchors}/{num_classes} valid anchors (Dropped {num_classes-active_anchors} sparse classes)")
+        return means.to(self.device), vars.to(self.device)
 
     def _compute_fisher(self):
         """
@@ -990,29 +1359,6 @@ class TrainerImpl:
                 ).sum()
         return penalty
 
-    def _compute_kl_loss(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        KL divergence between current batch embedding distribution and
-        pretrain reference distribution (stored in state after pretrain).
-        Closed-form KL between diagonal Gaussians:
-            KL(N(mu1,var1) || N(mu2,var2))
-        Returns scalar — 0 if reference stats not available.
-        """
-        if self.state.pretrain_emb_mean is None:
-            return torch.tensor(0.0, device=self.device)
-        mu1  = embeddings.mean(0)
-        var1 = embeddings.var(0).clamp(min=1e-8)
-        mu2  = self.state.pretrain_emb_mean
-        var2 = self.state.pretrain_emb_var.clamp(min=1e-8)
-        D    = mu1.shape[0]
-        kl   = 0.5 * (
-            (var1 / var2).sum() +
-            ((mu2 - mu1) ** 2 / var2).sum() -
-            D +
-            (var2.log().sum() - var1.log().sum())
-        )
-        return kl
-
     def _load_pretrain_best(self):
         """
         Internal — called at end of pretrain() before returning to caller.
@@ -1032,16 +1378,16 @@ class TrainerImpl:
             self.state.pretrain_export_path = ''
             return
 
-        # Load best weights into live model
-        ModelFactory.load(self.model, path)
-        self.model.to(self.device)
-
         # Always keep checkpoint — cleanup decision is ExperimentRunner's
-        self.state.pretrain_export_path = path
-        print(f"  Pretrain checkpoint: {path}")
+        # Load best weights and sync metrics from metadata
+        checkpoint = ModelFactory.load(self.model, path)
+        meta = checkpoint.get('metadata', {})
 
-        self.state.pretrain_best_val_loss = self.state.best_val_loss
-        self.state.pretrain_best_val_acc  = self.state.best_val_acc
+        self.state.pretrain_best_val_loss = meta.get('val_loss', self.state.best_val_loss)
+        self.state.pretrain_best_val_acc  = meta.get('val_acc', self.state.best_val_acc)
+        self.state.pretrain_export_path   = path
+        self.state.is_pretrained          = True
+        print(f"  Pretrain best loaded: {path} | acc: {self.state.pretrain_best_val_acc:.4f}")
 
 
     def _load_train_best(self):
@@ -1064,12 +1410,14 @@ class TrainerImpl:
             return
 
         # Load best weights into live model
-        ModelFactory.load(self.model, path)
-        self.model.to(self.device)
+        checkpoint = ModelFactory.load(self.model, path)
+        meta = checkpoint.get('metadata', {})
 
-        # Always keep checkpoint — cleanup decision is ExperimentRunner's
+        self.state.best_val_loss     = meta.get('val_loss', self.state.best_val_loss)
+        self.state.best_val_acc      = meta.get('val_acc', self.state.best_val_acc)        
         self.state.final_export_path = path
-        print(f"  Final model export: {path}")
+        self.state.is_trained        = True
+        print(f"  Final model best loaded: {path} | acc: {self.state.best_val_acc:.4f}")
 
     # ------------------------------------------------------------------
     # Logging
@@ -1087,6 +1435,7 @@ class TrainerImpl:
         )
 
 
+
 # ==============================================================================
 # StandardTrainer — thin wrapper
 # ==============================================================================
@@ -1097,7 +1446,7 @@ class StandardTrainer:
     Routes to TrainerImpl batch methods.
 
     Usage:
-        trainer = StandardTrainer(model, factory, config, device)
+        trainer = StandardTrainer(model, factory, config, device, seed=42)
         trainer.pretrain()
         trainer.train()
 
@@ -1108,22 +1457,23 @@ class StandardTrainer:
         history = trainer.impl.history
     """
 
-    def __init__(self,
-                 model,
-                 factory,
-                 config: TrainConfig,
-                 device: torch.device):
+    def __init__(self, model, factory, config: TrainConfig, device: torch.device, seed: int = 42):
         self.impl = TrainerImpl(
             model    = model,
             factory  = factory,
             config   = config,
             device   = device,
-            paradigm = 'standard'
+            paradigm = 'standard',
+            seed     = seed
         )
 
     def pretrain(self, optuna_trial=None):
         """Phase 1 — batch pretrain, shared with FewShot."""
         self.impl.pretrain(optuna_trial=optuna_trial)
+
+    def load_pretrain(self, path: str):
+        """Gateway to Phase 2 readiness."""
+        self.impl.load_pretrain(path)
 
     def train(self, optuna_trial=None):
         """Phase 2a — batch training on seen classes."""
@@ -1153,7 +1503,7 @@ class FewShotTrainer:
         val_unseen used for meta-validation (different classes from train).
 
     Usage:
-        trainer = FewShotTrainer(model, factory, config, device)
+        trainer = FewShotTrainer(model, factory, config, device, seed=42)
         trainer.pretrain()
         trainer.train()
 
@@ -1161,22 +1511,23 @@ class FewShotTrainer:
         best_loss = trainer.impl.state.best_val_loss
     """
 
-    def __init__(self,
-                 model,
-                 factory,
-                 config: TrainConfig,
-                 device: torch.device):
+    def __init__(self, model, factory, config: TrainConfig, device: torch.device, seed: int = 42):
         self.impl = TrainerImpl(
             model    = model,
             factory  = factory,
             config   = config,
             device   = device,
-            paradigm = 'fewshot'
+            paradigm = 'fewshot',
+            seed     = seed
         )
 
     def pretrain(self, optuna_trial=None):
         """Phase 1 — batch pretrain, shared with Standard."""
         self.impl.pretrain(optuna_trial=optuna_trial)
+
+    def load_pretrain(self, path: str):
+        """Gateway to Phase 2 readiness."""
+        self.impl.load_pretrain(path)
 
     def train(self, optuna_trial=None):
         """Phase 2b — episodic meta-training on base classes."""

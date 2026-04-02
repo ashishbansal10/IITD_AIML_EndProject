@@ -506,6 +506,9 @@ class ExperimentRunner:
             best_hps["train"] = train_hps
             self._apply_train_hps(run_cfg, train_hps, run_cfg.train_tune_config)
             trainer = self._make_trainer(run_cfg, model)
+            # Restores pretrain_best_val_acc and inits LCA/EWC
+            if pretrain_ckpt:
+                trainer.load_pretrain(pretrain_ckpt)
 
         # ── Train + evaluate ──────────────────────────────────────────
         trainer.train()
@@ -647,9 +650,9 @@ class ExperimentRunner:
     def _make_trainer(self, run_cfg: ExperimentConfig, model):
         """Create StandardTrainer or FewShotTrainer based on paradigm."""
         if run_cfg.paradigm == 'standard':
-            return StandardTrainer(model, self.factory, run_cfg.train_config, self.device)
+            return StandardTrainer(model, self.factory, run_cfg.train_config, self.device, seed=run_cfg.random_seed)
         elif run_cfg.paradigm == 'fewshot':
-            return FewShotTrainer(model, self.factory, run_cfg.train_config, self.device)
+            return FewShotTrainer(model, self.factory, run_cfg.train_config, self.device, seed=run_cfg.random_seed)
         raise ValueError(f"Unknown paradigm: '{run_cfg.paradigm}'. Use 'standard' or 'fewshot'.")
 
     def _has_any_tuner(self, run_cfg: ExperimentConfig) -> bool:

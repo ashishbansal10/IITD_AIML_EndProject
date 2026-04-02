@@ -12,7 +12,7 @@ Evaluator   — produces RunScores for one model
 
 Per-Run Score Collection
 ------------------------
-Each run produces 5 scores independently:
+Each run produces 6 scores independently:
 
     pretrain_softmax    — softmax accuracy on test seen, pretrain checkpoint
                           top1, no CI (full deterministic batch pass)
@@ -337,7 +337,7 @@ class Evaluator:
     # Phase eval — called from ExperimentRunner
     # ------------------------------------------------------------------
 
-    def eval_pretrain(self, model) -> Tuple[EvalResult, EvalResult]:
+    def eval_pretrain(self, model) -> Tuple[EvalResult, EvalResult, EvalResult]:
         """
         Evaluates at pretrain checkpoint.
         Returns (pretrain_softmax, pretrain_proto_seen, pretrain_proto_novel).
@@ -377,7 +377,7 @@ class Evaluator:
                 trained_softmax:      EvalResult,
                 trained_proto_seen:   EvalResult,
                 trained_proto_novel:  EvalResult) -> RunScores:
-        """Packs all 5 EvalResults into RunScores."""
+        """Packs all 6 EvalResults into RunScores."""
         run_scores = RunScores(
             run_id               = run_id,
             paradigm             = paradigm,
