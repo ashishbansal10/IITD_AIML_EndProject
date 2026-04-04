@@ -1,0 +1,125 @@
+2026-04-04 09:51:17,039 INFO | Sampler: GridSampler (exhaustive: 12 combos)
+2026-04-04 09:51:17,040 INFO | Pruner: MedianPruner (exhaustive or Hyperband not viable: n_trials=12 combos=12 min_res=12 max_res=30)
+2026-04-04 09:51:17,041 INFO | HPTuner initialized — run_id=tune_r2_cnn_fewshot paradigm=fewshot phase=train logs_dir=tune_logs
+2026-04-04 09:51:17,081 INFO | Tuner started — run_id=tune_r2_cnn_fewshot phase=train n_trials=12
+2026-04-04 09:51:17,082 INFO | Search space model: None
+2026-04-04 09:51:17,082 INFO | Search space train: {'warm_start': [False, True], 'freeze_n_epochs': [0, 3], 'joint_loss_alpha_rkd': [0.0, 1.0, 5.0]}
+2026-04-04 09:51:17,083 INFO | Total space size: 12 | n_trials: 12
+2026-04-04 09:51:17,083 INFO | Objective: train val_loss (reusing pretrain ckpt)
+2026-04-04 09:51:17,125 INFO | 
+Trial 0 | model={} trainer={'warm_start': True, 'freeze_n_epochs': 0, 'joint_loss_alpha_rkd': 0.0}
+2026-04-04 09:51:17,252 INFO | Trial 0 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 09:51:17,252 INFO | Trial 0 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 09:51:17,303 INFO | Trial 0 | Running Train
+2026-04-04 09:57:24,512 INFO | Trial 0 | Step=30 | objective(val_loss)=0.7304 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.7304 train_acc=0.7250 acc_delta=+0.0642
+2026-04-04 09:57:24,798 INFO | Trial 0 END | val_loss=0.7304
+2026-04-04 09:57:24,825 INFO | Trial 0 | objective=0.7304 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.7304 train_acc=0.7250 acc_delta=+0.0642 | best_so_far=0.7304 | params={'trainer_combo_idx': 6}
+2026-04-04 09:57:24,860 INFO | 
+Trial 1 | model={} trainer={'warm_start': True, 'freeze_n_epochs': 3, 'joint_loss_alpha_rkd': 5.0}
+2026-04-04 09:57:24,988 INFO | Trial 1 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 09:57:24,989 INFO | Trial 1 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 09:57:25,035 INFO | Trial 1 | Running Train
+2026-04-04 10:04:31,556 INFO | Trial 1 | Step=30 | objective(val_loss)=0.6967 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.6967 train_acc=0.7452 acc_delta=+0.0845
+2026-04-04 10:04:31,840 INFO | Trial 1 END | val_loss=0.6967
+2026-04-04 10:04:31,869 INFO | Trial 1 | objective=0.6967 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.6967 train_acc=0.7452 acc_delta=+0.0845 | best_so_far=0.6967 | params={'trainer_combo_idx': 11}
+2026-04-04 10:04:31,905 INFO | 
+Trial 2 | model={} trainer={'warm_start': False, 'freeze_n_epochs': 3, 'joint_loss_alpha_rkd': 1.0}
+2026-04-04 10:04:32,041 INFO | Trial 2 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:04:32,042 INFO | Trial 2 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:04:32,094 INFO | Trial 2 | Running Train
+2026-04-04 10:11:37,029 INFO | Trial 2 | Step=30 | objective(val_loss)=0.7177 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.7177 train_acc=0.7276 acc_delta=+0.0669
+2026-04-04 10:11:37,316 INFO | Trial 2 END | val_loss=0.7177
+2026-04-04 10:11:37,338 INFO | Trial 2 | objective=0.7177 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.7177 train_acc=0.7276 acc_delta=+0.0669 | best_so_far=0.6967 | params={'trainer_combo_idx': 4}
+2026-04-04 10:11:37,375 INFO | 
+Trial 3 | model={} trainer={'warm_start': True, 'freeze_n_epochs': 3, 'joint_loss_alpha_rkd': 1.0}
+2026-04-04 10:11:37,503 INFO | Trial 3 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:11:37,504 INFO | Trial 3 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:11:37,549 INFO | Trial 3 | Running Train
+2026-04-04 10:18:43,641 INFO | Trial 3 | Step=30 | objective(val_loss)=0.7103 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.7103 train_acc=0.7300 acc_delta=+0.0692
+2026-04-04 10:18:43,925 INFO | Trial 3 END | val_loss=0.7103
+2026-04-04 10:18:43,952 INFO | Trial 3 | objective=0.7103 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.7103 train_acc=0.7300 acc_delta=+0.0692 | best_so_far=0.6967 | params={'trainer_combo_idx': 10}
+2026-04-04 10:18:43,990 INFO | 
+Trial 4 | model={} trainer={'warm_start': False, 'freeze_n_epochs': 0, 'joint_loss_alpha_rkd': 5.0}
+2026-04-04 10:18:44,127 INFO | Trial 4 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:18:44,128 INFO | Trial 4 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:18:44,180 INFO | Trial 4 | Running Train
+2026-04-04 10:26:08,882 INFO | Trial 4 | Step=30 | objective(val_loss)=0.6886 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.6886 train_acc=0.7450 acc_delta=+0.0842
+2026-04-04 10:26:09,157 INFO | Trial 4 END | val_loss=0.6886
+2026-04-04 10:26:09,182 INFO | Trial 4 | objective=0.6886 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.6886 train_acc=0.7450 acc_delta=+0.0842 | best_so_far=0.6886 | params={'trainer_combo_idx': 2}
+2026-04-04 10:26:09,217 INFO | 
+Trial 5 | model={} trainer={'warm_start': True, 'freeze_n_epochs': 0, 'joint_loss_alpha_rkd': 5.0}
+2026-04-04 10:26:09,344 INFO | Trial 5 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:26:09,345 INFO | Trial 5 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:26:09,391 INFO | Trial 5 | Running Train
+2026-04-04 10:33:35,243 INFO | Trial 5 | Step=30 | objective(val_loss)=0.6856 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.6856 train_acc=0.7469 acc_delta=+0.0861
+2026-04-04 10:33:35,522 INFO | Trial 5 END | val_loss=0.6856
+2026-04-04 10:33:35,547 INFO | Trial 5 | objective=0.6856 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.6856 train_acc=0.7469 acc_delta=+0.0861 | best_so_far=0.6856 | params={'trainer_combo_idx': 8}
+2026-04-04 10:33:35,582 INFO | 
+Trial 6 | model={} trainer={'warm_start': False, 'freeze_n_epochs': 0, 'joint_loss_alpha_rkd': 1.0}
+2026-04-04 10:33:35,710 INFO | Trial 6 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:33:35,711 INFO | Trial 6 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:33:35,757 INFO | Trial 6 | Running Train
+2026-04-04 10:39:01,896 INFO | Trial 6 SCUTTLED (Early Exit) via Pruner
+2026-04-04 10:39:02,284 INFO | Trial 6 | objective=0.7244 | pretrain_loss=nan pretrain_acc=nan | train_loss=nan train_acc=nan acc_delta=+nan | best_so_far=0.6856 | params={'trainer_combo_idx': 1}
+2026-04-04 10:39:02,321 INFO | 
+Trial 7 | model={} trainer={'warm_start': True, 'freeze_n_epochs': 0, 'joint_loss_alpha_rkd': 1.0}
+2026-04-04 10:39:02,461 INFO | Trial 7 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:39:02,462 INFO | Trial 7 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:39:02,517 INFO | Trial 7 | Running Train
+2026-04-04 10:43:15,804 INFO | Trial 7 SCUTTLED (Early Exit) via Pruner
+2026-04-04 10:44:36,297 INFO | Trial 7 | objective=0.7291 | pretrain_loss=nan pretrain_acc=nan | train_loss=nan train_acc=nan acc_delta=+nan | best_so_far=0.6856 | params={'trainer_combo_idx': 7}
+2026-04-04 10:44:36,338 INFO | 
+Trial 8 | model={} trainer={'warm_start': True, 'freeze_n_epochs': 3, 'joint_loss_alpha_rkd': 0.0}
+2026-04-04 10:44:36,467 INFO | Trial 8 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:44:36,468 INFO | Trial 8 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:44:36,513 INFO | Trial 8 | Running Train
+2026-04-04 10:47:25,192 INFO | Trial 8 SCUTTLED (Early Exit) via Pruner
+2026-04-04 10:48:45,668 INFO | Trial 8 | objective=0.7731 | pretrain_loss=nan pretrain_acc=nan | train_loss=nan train_acc=nan acc_delta=+nan | best_so_far=0.6856 | params={'trainer_combo_idx': 9}
+2026-04-04 10:48:45,705 INFO | 
+Trial 9 | model={} trainer={'warm_start': False, 'freeze_n_epochs': 3, 'joint_loss_alpha_rkd': 0.0}
+2026-04-04 10:48:45,835 INFO | Trial 9 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:48:45,836 INFO | Trial 9 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:48:45,880 INFO | Trial 9 | Running Train
+2026-04-04 10:51:21,132 INFO | Trial 9 SCUTTLED (Early Exit) via Pruner
+2026-04-04 10:52:41,613 INFO | Trial 9 | objective=0.7958 | pretrain_loss=nan pretrain_acc=nan | train_loss=nan train_acc=nan acc_delta=+nan | best_so_far=0.6856 | params={'trainer_combo_idx': 3}
+2026-04-04 10:52:41,656 INFO | 
+Trial 10 | model={} trainer={'warm_start': False, 'freeze_n_epochs': 0, 'joint_loss_alpha_rkd': 0.0}
+2026-04-04 10:52:41,789 INFO | Trial 10 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:52:41,790 INFO | Trial 10 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:52:41,835 INFO | Trial 10 | Running Train
+2026-04-04 10:55:45,179 INFO | Trial 10 SCUTTLED (Early Exit) via Pruner
+2026-04-04 10:57:05,685 INFO | Trial 10 | objective=0.7526 | pretrain_loss=nan pretrain_acc=nan | train_loss=nan train_acc=nan acc_delta=+nan | best_so_far=0.6856 | params={'trainer_combo_idx': 0}
+2026-04-04 10:57:05,728 INFO | 
+Trial 11 | model={} trainer={'warm_start': False, 'freeze_n_epochs': 3, 'joint_loss_alpha_rkd': 5.0}
+2026-04-04 10:57:05,858 INFO | Trial 11 | Factor: 0.38 | Workload: pretrain 30ep, train 30ep, 187tr/56vl episodes
+2026-04-04 10:57:05,859 INFO | Trial 11 | Loading pretrain checkpoint from tune_checkpoints/tune_r2_cnn_fewshot_pretrain_best.pt
+2026-04-04 10:57:05,904 INFO | Trial 11 | Running Train
+2026-04-04 11:04:11,717 INFO | Trial 11 | Step=30 | objective(val_loss)=0.6903 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.6903 train_acc=0.7419 acc_delta=+0.0811
+2026-04-04 11:05:32,092 INFO | Trial 11 END | val_loss=0.6903
+2026-04-04 11:05:32,123 INFO | Trial 11 | objective=0.6903 | pretrain_loss=1.5442 pretrain_acc=0.6608 | train_loss=0.6903 train_acc=0.7419 acc_delta=+0.0811 | best_so_far=0.6856 | params={'trainer_combo_idx': 5}
+2026-04-04 11:05:32,126 INFO | 
+2026-04-04 11:05:32,127 INFO | === TUNING SUMMARY === study=tune_v2_fewshot ===
+2026-04-04 11:05:32,128 INFO |   Best trial  : 5
+2026-04-04 11:05:32,128 INFO |   Objective   : 0.6856  (val_loss — lower is better)
+2026-04-04 11:05:32,129 INFO |   Pretrain    : val_loss=1.5442  val_acc=0.6608  (baseline)
+2026-04-04 11:05:32,130 INFO |   Train       : val_loss=0.6856  val_acc=0.7469  acc_delta=+0.0861
+2026-04-04 11:05:32,130 INFO |   Best HPs:
+2026-04-04 11:05:32,131 INFO |       [trainer] warm_start           : True
+2026-04-04 11:05:32,131 INFO |       [trainer] freeze_n_epochs      : 0
+2026-04-04 11:05:32,132 INFO |       [trainer] joint_loss_alpha_rkd : 5.0
+2026-04-04 11:05:32,149 INFO | 
+ trial  trainer_combo_idx  pretrain_val_loss  pretrain_val_acc  train_val_loss  train_val_acc  val_acc_delta  objective
+     5                  8             1.5442            0.6608          0.6856         0.7469         0.0861     0.6856
+     4                  2             1.5442            0.6608          0.6886         0.7450         0.0842     0.6886
+    11                  5             1.5442            0.6608          0.6903         0.7419         0.0811     0.6903
+     1                 11             1.5442            0.6608          0.6967         0.7452         0.0845     0.6967
+     3                 10             1.5442            0.6608          0.7103         0.7300         0.0692     0.7103
+     2                  4             1.5442            0.6608          0.7177         0.7276         0.0669     0.7177
+     6                  1                NaN               NaN             NaN            NaN            NaN     0.7244
+     7                  7                NaN               NaN             NaN            NaN            NaN     0.7291
+     0                  6             1.5442            0.6608          0.7304         0.7250         0.0642     0.7304
+    10                  0                NaN               NaN             NaN            NaN            NaN     0.7526
+     8                  9                NaN               NaN             NaN            NaN            NaN     0.7731
+     9                  3                NaN               NaN             NaN            NaN            NaN     0.7958
+2026-04-04 11:05:32,164 INFO | Styled HTML table: tune_logs/tuner.tune_r2_cnn_fewshot_tune_v2_fewshot_train_trials_table.html
+2026-04-04 11:05:32,167 INFO | Tuner complete [tune_r2_cnn_fewshot] — best_trial=5 best_value=0.6856 best_hps={'model': {}, 'trainer': {'warm_start': True, 'freeze_n_epochs': 0, 'joint_loss_alpha_rkd': 5.0}} log=tune_logs/tuner.tune_r2_cnn_fewshot_tune_v2_fewshot_train.log
