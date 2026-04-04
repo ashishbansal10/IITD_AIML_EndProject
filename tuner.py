@@ -1109,23 +1109,16 @@ class HPStudyAnalyzer:
         path = f"{self._prefix}_{filename}.html"
         fig.write_html(path)
         print(f"  Saved: {path}")
-        try:
-            from IPython.display import display, HTML
-            display(HTML(fig.to_html(include_plotlyjs='cdn')))
-        except Exception:
-            pass
+        fig.show()
 
     def _save_df_html(self, styled, filename: str):
         """Save pandas Styler to HTML in logs_dir and display inline in notebook."""
         path = f"{self._prefix}_{filename}.html"
         styled.to_html(path)
         print(f"  Saved: {path}")
-        try:
-            from IPython.display import display, HTML
-            with open(path) as f:
-                display(HTML(f.read()))
-        except Exception:
-            pass
+        from IPython.display import display
+        display(styled)
+
 
     def _encode_hps_numeric(self, df, hp_cols: list) -> 'pd.DataFrame':
         """
@@ -1413,7 +1406,11 @@ class HPStudyAnalyzer:
         n    = len(hp_cols)
         cols = min(3, n)
         rows = ceil(n / cols)
-        fig  = ps.make_subplots(rows=rows, cols=cols, subplot_titles=hp_cols)
+        fig  = ps.make_subplots(
+            rows=rows, cols=cols, subplot_titles=hp_cols,
+            vertical_spacing=0.12,   # Adds breathing room between rows
+            horizontal_spacing=0.08  # Adds breathing room between columns
+        )
         is_delta = 'delta' in metric.lower()
 
         for i, hp in enumerate(hp_cols):
@@ -1434,6 +1431,7 @@ class HPStudyAnalyzer:
             title      = f'{self.study_name} — HP Trend: {metric} per HP value',
             height     = 380 * rows,
             showlegend = False,
+            margin=dict(l=50, r=50, t=100, b=50) # Prevents clipping of titles
         )
         self._save_html(fig, f'hp_trend_{metric}')
 
