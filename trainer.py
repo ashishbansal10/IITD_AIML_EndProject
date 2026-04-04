@@ -168,7 +168,7 @@ class TrainConfig:
     # ── Train phase improvements (all default to disabled = current behaviour) ──
     ewc_lambda:       float = 0.0    # EWC penalty weight — 0.0 = disabled
     freeze_n_epochs:  int   = 0      # freeze backbone's first N train epochs — 0 = disabled
-    warm_start:       bool  = False  # init train early-stop from pretrain best — False = reset
+    warm_start:       bool  = True   # init train early-stop from pretrain best using zero shot anchor validation — False = reset
 
 
     # ── Joint loss regularization (LCA + RKD) ─────────────────────────
@@ -594,7 +594,7 @@ class TrainerImpl:
         
         _setup_optimizer()          — AdamW with optional per-component lr
         _setup_scheduler()          — step/cosine/none
-        _is_improved()              — val_loss improvement check
+        _check_and_update_best()    — val_loss improvement check and update
         _early_stopping_check()     — returns True if should stop
         _log_epoch()                — prints epoch metrics
         _save_checkpoint()          — via ModelFactory
@@ -784,7 +784,7 @@ class TrainerImpl:
         )
 
         # Restore best-train-epoch weights before returning.
-        self._load_train_best()
+        self._load_train_best(episodic=False)
         self.model.unfreeze('prototypical')
         self.model.to(self.device)
 
@@ -824,7 +824,7 @@ class TrainerImpl:
         # restores frozen_names from checkpoint — linear will be frozen again.
         # This is correct: fewshot eval uses prototypical path, not linear.
         # Softmax eval uses pretrain-era linear weights — intentional diagnostic.
-        self._load_train_best()
+        self._load_train_best(episodic=True)
         self.model.unfreeze('linear')
         self.model.unfreeze('softmax')
         self.model.to(self.device)
@@ -869,14 +869,15 @@ class TrainerImpl:
 
             # --- INSERTED CODE START for Optuna ---
             if optuna_trial is not None:
-                optuna_trial.report(val_loss, step=self.state.total_steps_run)
+                report_val = val_loss if self.config.early_stop_metric == 'val_loss' else val_acc
+                optuna_trial.report(report_val, step=self.state.total_steps_run)
                 if optuna_trial.should_prune():
                     import optuna
                     raise optuna.TrialPruned()
             # --- INSERTED CODE END ---
 
             # Checkpoint on improvement
-            if self._is_improved(val_loss, val_acc):
+            if self._check_and_update_best(val_loss, val_acc):
                 path = os.path.join( self.config.checkpoint_dir, f"{self.config.run_id}_pretrain_best.pt" )
                 self._save_checkpoint(path)
                 self._pretrain_best_path = path
@@ -964,6 +965,10 @@ class TrainerImpl:
         self._best_epoch = 0
         epochs_run = 0
 
+        prev_val_loss = float('inf')   # ADD — tracks prev best for warm_start early stop
+        prev_val_acc  = 0.0            # ADD — tracks prev best for val_acc metric
+
+
         for epoch in range(self.config.epochs_train):
             self.state.epoch = epoch
             epochs_run = epoch + 1
@@ -996,21 +1001,30 @@ class TrainerImpl:
 
             # --- INSERTED CODE START for Optuna ---
             if optuna_trial is not None:
-                optuna_trial.report(val_loss, step=self.state.total_steps_run)
+                report_val = val_loss if self.config.early_stop_metric == 'val_loss' else val_acc
+                optuna_trial.report(report_val, step=self.state.total_steps_run)
                 if optuna_trial.should_prune():
                     import optuna
                     raise optuna.TrialPruned()
             # --- INSERTED CODE END ---
 
             # Checkpoint on improvement
-            if self._is_improved(val_loss, val_acc):
+            if self._check_and_update_best(val_loss, val_acc):
+                prev_val_loss = val_loss            # ADD — sync prev with new best
+                prev_val_acc  = val_acc             # ADD — sync prev with new best
                 path = os.path.join(self.config.checkpoint_dir, f"{self.config.run_id}_train_best.pt")
                 self._save_checkpoint(path)
                 self._train_best_path = path
                 self._best_epoch = epoch
                 self.state.early_stop_counter   = 0
             else:
-                self.state.early_stop_counter += 1
+                # Only count when not improving vs prev AND above best floor
+                # Allows model to freely descend toward best without patience penalty
+                if not self._is_better(val_loss, val_acc, prev_val_loss, prev_val_acc):
+                    self.state.early_stop_counter += 1
+                else:
+                    prev_val_loss = val_loss    # ADD — update prev if actually better
+                    prev_val_acc  = val_acc     # ADD — update prev if actually better
 
             self.state.total_steps_run += 1
 
@@ -1205,24 +1219,25 @@ class TrainerImpl:
     # ------------------------------------------------------------------
     # Early stopping + checkpointing
     # ------------------------------------------------------------------
-
-    def _is_improved(self, val_loss: float, val_acc: float) -> bool:
-        """
-        Returns True if validation metric improved.
-        early_stop_metric='val_loss' → lower is better (default)
-        early_stop_metric='val_acc'  → higher is better
-        """
+    def _is_better(self, val_loss, val_acc, ref_loss, ref_acc) -> bool:
+        """Pure comparison against explicit reference — no state update."""
         if self.config.early_stop_metric == 'val_loss':
-            if val_loss < self.state.best_val_loss:
-                self.state.best_val_loss = val_loss
-                self.state.best_val_acc  = val_acc
-                return True
+            return val_loss < ref_loss
         else:
-            if val_acc > self.state.best_val_acc:
-                self.state.best_val_acc  = val_acc
-                self.state.best_val_loss = val_loss
-                return True
+            return val_acc > ref_acc
+
+
+    def _check_and_update_best(self, val_loss: float, val_acc: float) -> bool:
+        """
+        Compare against current best via _is_better, update state if improved.
+        Returns True if improved — caller resets counter and saves checkpoint.
+        """
+        if self._is_better(val_loss, val_acc, self.state.best_val_loss, self.state.best_val_acc):
+            self.state.best_val_loss = val_loss
+            self.state.best_val_acc  = val_acc
+            return True
         return False
+
 
     def _early_stopping_check(self) -> bool:
         """Returns True if training should stop."""
@@ -1390,31 +1405,64 @@ class TrainerImpl:
         print(f"  Pretrain best loaded: {path} | acc: {self.state.pretrain_best_val_acc:.4f}")
 
 
-    def _load_train_best(self):
+    def _load_train_best(self, episodic: bool):
         """
         Internal — called at end of train_batch() / train_episodic() before returning.
 
         1. Load best-train-epoch weights into model.
         2. Keep checkpoint file — ExperimentRunner._cleanup() decides later.
         3. Set state.final_export_path = path (always kept).
+
+        episodic : False = batch  (prototypical frozen during train)
+                   True  = episodic (linear + softmax frozen during train)
+
+        Fallback — if no train checkpoint was saved (warm_start=True and model never
+        beat pretrain anchor), loads pretrain best instead and restores exact frozen state
+        matching the train mode — so caller unfreeze calls behave identically.
+        Guarantees: final model is always at least pretrain quality.
         """
         from model_factory import ModelFactory
         path = self._train_best_path
 
         if not path or not os.path.exists(path):
-            print(
-                f"  Warning: train best checkpoint not found at '{path}'. "
-                f"Model remains at last epoch."
-            )
-            self.state.final_export_path = ''
+            # No train checkpoint saved — model never beat pretrain anchor
+            # Fallback to pretrain best rather than leaving model at last epoch
+            if self._pretrain_best_path and os.path.exists(self._pretrain_best_path):
+                print(
+                    f"  No train checkpoint saved — falling back to pretrain best "
+                    f"(warm_start floor: acc={self.state.pretrain_best_val_acc:.4f})"
+                )
+                checkpoint = ModelFactory.load(self.model, self._pretrain_best_path)
+                meta = checkpoint.get('metadata', {})
+                self.state.best_val_loss     = meta.get('val_loss', self.state.pretrain_best_val_loss)
+                self.state.best_val_acc      = meta.get('val_acc',  self.state.pretrain_best_val_acc)
+                self.state.final_export_path = self._pretrain_best_path
+                self.state.is_trained        = True
+
+                # Restore frozen state matching train mode —
+                # caller's unfreeze calls after return behave identically
+                self.model.unfreeze_all()
+                if episodic:
+                    self.model.freeze('linear')
+                    self.model.freeze('softmax')
+                else:
+                    self.model.freeze('prototypical')
+
+                print(f"  Pretrain fallback loaded: {self._pretrain_best_path} | acc: {self.state.best_val_acc:.4f}")
+            else:
+                print(
+                    f"  Warning: neither train nor pretrain best checkpoint found. "
+                    f"Model remains at last epoch."
+                )
+                self.state.final_export_path = ''
             return
 
-        # Load best weights into live model
+        # Load best train weights into live model
         checkpoint = ModelFactory.load(self.model, path)
         meta = checkpoint.get('metadata', {})
 
         self.state.best_val_loss     = meta.get('val_loss', self.state.best_val_loss)
-        self.state.best_val_acc      = meta.get('val_acc', self.state.best_val_acc)        
+        self.state.best_val_acc      = meta.get('val_acc', self.state.best_val_acc)
         self.state.final_export_path = path
         self.state.is_trained        = True
         print(f"  Final model best loaded: {path} | acc: {self.state.best_val_acc:.4f}")

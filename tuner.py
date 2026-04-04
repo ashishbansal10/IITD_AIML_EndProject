@@ -556,7 +556,6 @@ class HPTuner:
         self.best_hps   = self._resolve_best_hps(study.best_trial.params)
 
         self.print_summary(study)
-        self._export_visualizations(study)
         self._logger.info(
             f"Tuner complete [{self.run_id}] — "
             f"best_trial={study.best_trial.number} "
@@ -755,120 +754,6 @@ class HPTuner:
     # Callback
     # ------------------------------------------------------------------
 
-    def _export_visualizations(self, study):
-        """
-        Export Optuna visualizations as HTML files to logs_dir.
-        Requires plotly — silently skipped if not installed.
-
-        Files produced:
-            {run_id}_{study_name}_opt_history.html    — objective per trial
-            {run_id}_{study_name}_param_importance.html — HP importance ranking
-            {run_id}_{study_name}_parallel_coord.html — all HPs vs objective
-            {run_id}_{study_name}_acc_delta.html      — val_acc delta per trial (custom)
-        """
-        try:
-            import optuna.visualization as vis
-            import plotly.graph_objects as go
-
-            prefix = os.path.join(
-                os.path.dirname(self._log_path),
-                f"tuner.{self.run_id}_{self.tune_config.study_name}"
-            )
-
-            # 1. Optimization history — objective per trial
-            try:
-                vis.plot_optimization_history(study).write_html(f"{prefix}_opt_history.html")
-            except Exception as e:
-                self._logger.warning(f"opt_history plot failed: {e}")
-
-            # 2. HP importance ranking
-            try:
-                vis.plot_param_importances(study).write_html(f"{prefix}_param_importance.html")
-            except Exception as e:
-                self._logger.warning(f"param_importance plot failed: {e}")
-
-            # 3. Parallel coordinate — all HPs vs objective
-            try:
-                vis.plot_parallel_coordinate(study).write_html(f"{prefix}_parallel_coord.html")
-            except Exception as e:
-                self._logger.warning(f"parallel_coord plot failed: {e}")
-
-            # 4. Custom — val_acc_delta per trial (key metric for our goal)
-            try:
-                trials  = [t for t in study.trials if t.value is not None]
-                numbers = [t.number for t in trials]
-                deltas  = [t.user_attrs.get('val_acc_delta', float('nan')) for t in trials]
-                p_accs  = [t.user_attrs.get('pretrain_val_acc', float('nan')) for t in trials]
-                tr_accs = [t.user_attrs.get('train_val_acc',    float('nan')) for t in trials]
-
-                fig = go.Figure()
-                fig.add_trace(go.Bar(
-                    x=numbers, y=deltas,
-                    name='val_acc_delta (train - pretrain)',
-                    marker_color=['green' if d >= 0 else 'red' for d in deltas],
-                ))
-                fig.add_trace(go.Scatter(
-                    x=numbers, y=p_accs,
-                    name='pretrain_val_acc (baseline)',
-                    mode='lines', line=dict(color='blue', dash='dash'),
-                ))
-                fig.add_trace(go.Scatter(
-                    x=numbers, y=tr_accs,
-                    name='train_val_acc',
-                    mode='lines+markers', line=dict(color='orange'),
-                ))
-                fig.add_hline(y=0, line_color='black', line_dash='dot', annotation_text='no degradation')
-                fig.update_layout(
-                    title=f'{self.tune_config.study_name} — val_acc: pretrain vs train per trial',
-                    xaxis_title='Trial', yaxis_title='val_acc',
-                    barmode='overlay',
-                )
-                fig.write_html(f"{prefix}_acc_delta.html")
-            except Exception as e:
-                self._logger.warning(f"acc_delta plot failed: {e}")
-
-            # 5. val_acc vs val_loss scatter — tradeoff view
-            if self.phase in ('train', 'full'):
-                try:
-                    tr_losses = [t.user_attrs.get('train_val_loss', None) for t in trials]
-                    tr_accs   = [t.user_attrs.get('train_val_acc',  None) for t in trials]
-                    p_acc_ref = trials[0].user_attrs.get('pretrain_val_acc', None) if trials else None
-
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=tr_losses, y=tr_accs,
-                        mode='markers+text',
-                        text=[str(t.number) for t in trials],
-                        textposition='top center',
-                        marker=dict(
-                            size=10,
-                            color=[t.value for t in trials],
-                            colorscale='RdYlGn_r',
-                            colorbar=dict(title='objective'),
-                            showscale=True,
-                        ),
-                        name='trials',
-                    ))
-                    if p_acc_ref is not None:
-                        fig.add_hline(
-                            y=p_acc_ref, line_color='blue', line_dash='dash',
-                            annotation_text=f'pretrain_val_acc={p_acc_ref:.4f}',
-                            annotation_position='right',
-                        )
-                    fig.update_layout(
-                        title=f'{self.tune_config.study_name} — val_acc vs val_loss per trial',
-                        xaxis_title='train_val_loss (lower=better)',
-                        yaxis_title='train_val_acc (higher=better)',
-                    )
-                    fig.write_html(f"{prefix}_acc_vs_loss.html")
-                except Exception as e:
-                    self._logger.warning(f"acc_vs_loss scatter failed: {e}")
-
-            self._logger.info(f"Visualizations exported to {prefix}_*.html")
-            print(f"  Visualizations: {prefix}_*.html")
-
-        except ImportError:
-            self._logger.info("plotly not installed — visualizations skipped")
 
     def _trial_callback(self, study, trial):
         """Logs per-trial summary — val_loss + val_acc + pretrain baseline + best so far."""
@@ -1005,3 +890,697 @@ class HPTuner:
             self._logger.warning(f"Styled HTML table failed: {e}")
 
         print(f"  Tuner summary written to {self._log_path}")
+
+# ==============================================================================
+# HPStudyAnalyzer — post-hoc study analysis, tables and plots
+# ==============================================================================
+
+class HPStudyAnalyzer:
+    """
+    Post-hoc analysis of a completed Optuna HP tuning study.
+    Loads from sqlite db (mandatory) + tuner log file (optional).
+    No training — read-only. Runs locally without GPU.
+
+    db_path is mandatory — all trial objectives and user_attrs are stored there.
+    log_path enables HP combo decoding (combo_idx → actual HP name/value dict).
+    Without log_path, only plot_opt_history, plot_learning_curves and
+    report_trials_table (objectives only) are available.
+
+    APIs — call each in a separate notebook cell:
+        load()                       load db + parse log, build DataFrame
+        report_summary()             stdout: best trial, coverage, top-5
+        report_trials_table()        HTML styled DataFrame, all trials
+        report_marginal_impact()     HTML styled table: avg obj/acc per HP value
+        plot_opt_history()           objective per trial + best-so-far line
+        plot_learning_curves()       per-trial epoch curves showing pruning
+        plot_hp_trend(metric)        box plots: metric distribution per HP value
+        plot_individual_importance() ranked bar: HP importance by Spearman correlation
+    """
+
+    def __init__(self,
+                 run_id:     str,
+                 study_name: str,
+                 db_path:    str,
+                 logs_dir:   str = 'tune_logs',
+                 log_path:   str = None,
+                 phase:      str = 'train'):
+        """
+        Args:
+            run_id     : run identifier used for output filenames
+                         e.g. 'tune_r2_cnn_fewshot'
+            study_name : must match the Optuna study name stored in db
+                         e.g. 'final'
+            db_path    : path to sqlite db file — use forward slashes on Windows
+                         e.g. 'tune_logs/final_study.db'
+                              'C:/path/to/final_study.db'
+            logs_dir   : output directory for generated HTML report files
+            log_path   : path to HPTuner .log file — enables HP combo decoding
+                         (maps combo_idx back to actual HP name/value dict)
+                         None → plot_opt_history and plot_learning_curves still work,
+                         but report_marginal_impact / plot_hp_trend /
+                         plot_individual_importance are unavailable
+            phase      : tuning phase the study ran — 'pretrain', 'train', or 'full'
+                         controls which user_attrs are expected in the db
+                         (train_val_loss/acc only stored for 'train' and 'full' phases)
+        """
+        self.run_id     = run_id
+        self.study_name = study_name
+        self.db_path    = db_path
+        self.logs_dir   = logs_dir
+        self.log_path   = log_path
+        self.phase      = phase
+        self.study      = None
+        self._df        = None
+        self._prefix    = os.path.join(logs_dir, f"tuner.{run_id}_{study_name}")
+
+        os.makedirs(logs_dir, exist_ok=True)
+
+        try:
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+            self._optuna = optuna
+        except ImportError:
+            raise ImportError("pip install optuna")
+
+        try:
+            import plotly.graph_objects as go
+            import plotly.express       as px
+            self._go = go
+            self._px = px
+        except ImportError:
+            raise ImportError("pip install plotly")
+
+        try:
+            import pandas as pd
+            self._pd = pd
+        except ImportError:
+            raise ImportError("pip install pandas")
+
+    # ------------------------------------------------------------------
+    # Load
+    # ------------------------------------------------------------------
+
+    def load(self) -> 'HPStudyAnalyzer':
+        """
+        Load study from sqlite db and parse log file for HP combo decoding.
+        Must be called before any report or plot API.
+
+        Returns self for chaining: analyzer.load().report_summary()
+        """
+        storage    = f"sqlite:///{self.db_path}"
+        self.study = self._optuna.load_study(
+            study_name = self.study_name,
+            storage    = storage,
+        )
+        hp_map   = self._parse_log() if self.log_path else {}
+        self._df = self._build_df(hp_map)
+
+        completed = len(self._df)
+        pruned    = sum(
+            1 for t in self.study.trials
+            if t.state == self._optuna.trial.TrialState.PRUNED
+        )
+        total   = len(self.study.trials)
+        hp_cols = self._hp_cols()
+
+        print(f"\nStudy loaded: '{self.study_name}' from {self.db_path}")
+        print(f"  Total trials   : {total}")
+        print(f"  Completed      : {completed}")
+        print(f"  Pruned/skipped : {pruned}")
+        print(f"  HP columns     : {hp_cols if hp_cols else 'none (log_path not set)'}")
+        print(f"  Best trial     : #{self.study.best_trial.number}")
+        print(f"  Best objective : {self.study.best_trial.value:.4f}")
+        return self
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _parse_log(self) -> dict:
+        """
+        Parse HPTuner log file to build {trial_number: {hp_name: value}} mapping.
+
+        Reads lines of the form:
+            Trial N | model={} trainer={'warm_start': False, 'freeze_n_epochs': 0, ...}
+
+        These lines are written by HPTuner._logger at the start of each _objective call,
+        before training begins — so they are present even for pruned trials.
+
+        Returns dict keyed by trial number. Trials whose log line cannot be parsed
+        are silently skipped.
+        """
+        import re
+        import ast as _ast
+        hp_map  = {}
+        pattern = re.compile(r"Trial (\d+) \| model=(\{.*?\}) trainer=(\{.*\})")
+        try:
+            with open(self.log_path, 'r') as f:
+                for line in f:
+                    m = pattern.search(line)
+                    if m:
+                        trial_num = int(m.group(1))
+                        try:
+                            hp_map[trial_num] = _ast.literal_eval(m.group(3))
+                        except Exception:
+                            pass
+        except FileNotFoundError:
+            print(f"  Warning: log not found at {self.log_path} — HP decoding skipped")
+        print(f"  Parsed HP combos from log: {len(hp_map)} trials")
+        return hp_map
+
+    def _build_df(self, hp_map: dict) -> 'pd.DataFrame':
+        """
+        Build complete DataFrame by merging study trial data with decoded HP values.
+
+        Columns:
+            trial           : trial number
+            objective       : Optuna objective value (val_loss)
+            <hp_cols>       : one column per decoded HP (from log)
+            pretrain_val_loss/acc  : from trial user_attrs (all phases)
+            train_val_loss/acc     : from trial user_attrs (train/full phases only)
+            val_acc_delta          : train_val_acc - pretrain_val_acc
+
+        Only includes trials with a recorded objective (t.value is not None).
+        Pruned trials have objective = last reported val_loss, but nan for
+        train_val_* since training never completed.
+        """
+        pd      = self._pd
+        all_hps = sorted({k for hps in hp_map.values() for k in hps.keys()})
+        rows    = []
+
+        for t in sorted(self.study.trials, key=lambda x: x.number):
+            if t.value is None:
+                continue
+            row = {'trial': t.number, 'objective': t.value}
+            hps = hp_map.get(t.number, {})
+            for k in all_hps:
+                row[k] = hps.get(k, None)
+            row['pretrain_val_loss'] = t.user_attrs.get('pretrain_val_loss', float('nan'))
+            row['pretrain_val_acc']  = t.user_attrs.get('pretrain_val_acc',  float('nan'))
+            if self.phase in ('train', 'full'):
+                row['train_val_loss'] = t.user_attrs.get('train_val_loss', float('nan'))
+                row['train_val_acc']  = t.user_attrs.get('train_val_acc',  float('nan'))
+                row['val_acc_delta']  = t.user_attrs.get('val_acc_delta',  float('nan'))
+            rows.append(row)
+
+        return pd.DataFrame(rows)
+
+    def _check_loaded(self):
+        """Raise if load() has not been called."""
+        if self.study is None or self._df is None:
+            raise RuntimeError("Call analyzer.load() before generating reports.")
+
+    def _hp_cols(self) -> list:
+        """Return HP column names from DataFrame (excludes metric columns)."""
+        if self._df is None:
+            return []
+        non_hp = {'trial', 'objective', 'pretrain_val_loss', 'pretrain_val_acc',
+                  'train_val_loss', 'train_val_acc', 'val_acc_delta'}
+        return [c for c in self._df.columns if c not in non_hp]
+
+    def _metric_cols(self) -> list:
+        """Return metric column names present in DataFrame."""
+        return [c for c in ['objective', 'pretrain_val_acc', 'train_val_acc',
+                             'val_acc_delta', 'pretrain_val_loss', 'train_val_loss']
+                if c in self._df.columns]
+
+    def _save_html(self, fig, filename: str):
+        """Save plotly figure to HTML in logs_dir and display inline in notebook."""
+        path = f"{self._prefix}_{filename}.html"
+        fig.write_html(path)
+        print(f"  Saved: {path}")
+        try:
+            from IPython.display import display, HTML
+            display(HTML(fig.to_html(include_plotlyjs='cdn')))
+        except Exception:
+            pass
+
+    def _save_df_html(self, styled, filename: str):
+        """Save pandas Styler to HTML in logs_dir and display inline in notebook."""
+        path = f"{self._prefix}_{filename}.html"
+        styled.to_html(path)
+        print(f"  Saved: {path}")
+        try:
+            from IPython.display import display, HTML
+            with open(path) as f:
+                display(HTML(f.read()))
+        except Exception:
+            pass
+
+    def _encode_hps_numeric(self, df, hp_cols: list) -> 'pd.DataFrame':
+        """
+        Encode HP columns to numeric for correlation/importance calculations.
+        Handles bool (True/False stored as object or bool dtype),
+        string categories, and already-numeric values.
+        """
+        df = df.copy()
+        for col in hp_cols:
+            try:
+                df[col] = df[col].map(
+                    {True: 1.0, False: 0.0, 'True': 1.0, 'False': 0.0}
+                ).fillna(df[col].astype(float))
+            except Exception:
+                df[col] = df[col].astype('category').cat.codes.astype(float)
+        return df
+
+    # ------------------------------------------------------------------
+    # 1. Summary — stdout only
+    # ------------------------------------------------------------------
+
+    def report_summary(self):
+        """
+        Print best trial summary and overall study statistics to stdout.
+        No file output.
+
+        Shows:
+            - Total / completed / pruned trial counts
+            - Best trial number and objective value
+            - Pretrain baseline metrics (consistent across all trials — same checkpoint)
+            - Best train metrics and acc_delta (phase='train' or 'full' only)
+            - Best HP values for the best trial (requires log_path)
+        """
+        self._check_loaded()
+        bt    = self.study.best_trial
+        df    = self._df
+        total = len(self.study.trials)
+        done  = len(df)
+
+        p_loss = bt.user_attrs.get('pretrain_val_loss', float('nan'))
+        p_acc  = bt.user_attrs.get('pretrain_val_acc',  float('nan'))
+        tr_acc = bt.user_attrs.get('train_val_acc',     float('nan'))
+        tr_lss = bt.user_attrs.get('train_val_loss',    float('nan'))
+        delta  = bt.user_attrs.get('val_acc_delta',     float('nan'))
+
+        print(f"\n{'='*60}")
+        print(f"STUDY SUMMARY — {self.study_name}")
+        print(f"{'='*60}")
+        print(f"  Total trials   : {total}  |  Completed: {done}")
+        print(f"  Best trial     : #{bt.number}")
+        print(f"  Best objective : {bt.value:.4f}  (val_loss — lower is better)")
+        print(f"  Pretrain       : val_loss={p_loss:.4f}  val_acc={p_acc:.4f}  (baseline — same for all trials)")
+        if self.phase in ('train', 'full'):
+            print(f"  Best train     : val_loss={tr_lss:.4f}  val_acc={tr_acc:.4f}")
+            print(f"  Acc delta      : {delta:+.4f}  (train_acc - pretrain_acc)")
+
+        hp_cols = self._hp_cols()
+        if hp_cols:
+            best_row = df[df['trial'] == bt.number]
+            if not best_row.empty:
+                print(f"\n  Best HPs:")
+                for k in hp_cols:
+                    print(f"      {k:30s}: {best_row.iloc[0][k]}")
+
+    # ------------------------------------------------------------------
+    # 2. Trials table — styled HTML
+    # ------------------------------------------------------------------
+
+    def report_trials_table(self,
+                             sort_by:   str  = 'objective',
+                             ascending: bool = True,
+                             top_n:     int  = None):
+        """
+        Styled HTML DataFrame of all completed trials with gradient coloring.
+
+        Pruned trials have nan for train_val_* columns — training was cut short
+        by Hyperband before completing, so no best checkpoint was saved.
+
+        Args:
+            sort_by   : column to sort by — 'objective', 'train_val_acc', 'val_acc_delta'
+            ascending : True for min-first (objective), False for max-first (acc)
+            top_n     : show only top N trials after sorting — None shows all
+        """
+        self._check_loaded()
+        df = self._df.copy()
+        if sort_by not in df.columns:
+            print(f"  Warning: '{sort_by}' not found — defaulting to 'objective'")
+            sort_by, ascending = 'objective', True
+
+        df = df.sort_values(sort_by, ascending=ascending).reset_index(drop=True)
+        if top_n:
+            df = df.head(top_n)
+
+        mc = self._metric_cols()
+        styled = (
+            df.style
+            .format({c: '{:.4f}' for c in mc})
+            .background_gradient(subset=['objective'],     cmap='RdYlGn_r')
+            .background_gradient(
+                subset=['train_val_acc'] if 'train_val_acc' in df.columns else [],
+                cmap='RdYlGn')
+            .background_gradient(
+                subset=['val_acc_delta'] if 'val_acc_delta' in df.columns else [],
+                cmap='RdYlGn')
+            .highlight_min(subset=[sort_by] if ascending else [], color='#d4efdf')
+            .highlight_max(subset=[sort_by] if not ascending else [], color='#d4efdf')
+            .set_caption(
+                f"Trials — {self.study_name} | sorted by {sort_by}"
+                + (f" | top {top_n}" if top_n else "")
+            )
+            .set_table_styles([{
+                'selector': 'caption',
+                'props': [('font-size','14px'),('font-weight','bold'),('padding','8px')]
+            },{
+                'selector': 'th',
+                'props': [('background-color','#2c3e50'),('color','white'),
+                          ('padding','6px 10px'),('font-size','12px')]
+            },{
+                'selector': 'td',
+                'props': [('padding','4px 8px'),('font-size','11px')]
+            }])
+        )
+        self._save_df_html(styled, 'trials_table')
+
+    # ------------------------------------------------------------------
+    # 3. Marginal impact — per-HP average metrics
+    # ------------------------------------------------------------------
+
+    def report_marginal_impact(self):
+        """
+        Styled HTML table showing average and best metrics per unique HP value,
+        averaged across all other HPs (marginal effect).
+
+        For each HP — each unique value gets a row showing:
+            n           : number of completed trials using that value
+            avg_obj     : mean objective (val_loss) — lower is better
+            avg_acc     : mean train_val_acc — higher is better
+            avg_delta   : mean val_acc_delta — higher is better
+            best_obj    : best (lowest) objective seen for that value
+            best_acc    : best (highest) acc seen for that value
+
+        Only completed trials (non-nan train_val_acc) are included in acc/delta stats.
+        Pruned trials contribute to avg_obj only.
+
+        Requires log_path for HP decoding.
+        """
+        self._check_loaded()
+        hp_cols = self._hp_cols()
+        if not hp_cols:
+            print("  report_marginal_impact requires log_path for HP decoding.")
+            return
+
+        pd    = self._pd
+        mcols = [c for c in ['objective', 'train_val_acc', 'val_acc_delta']
+                 if c in self._df.columns]
+        rows  = []
+
+        for hp in hp_cols:
+            for val in sorted(self._df[hp].dropna().unique(), key=str):
+                sub = self._df[self._df[hp] == val]
+                row = {'hp': hp, 'value': str(val), 'n': len(sub)}
+                for m in mcols:
+                    sub_m = sub[m].dropna()
+                    row[f'avg_{m}']  = sub_m.mean()  if not sub_m.empty else float('nan')
+                    row[f'best_{m}'] = (sub_m.min()  if 'loss' in m or m == 'objective'
+                                        else sub_m.max()) if not sub_m.empty else float('nan')
+                rows.append(row)
+
+        imp_df = pd.DataFrame(rows)
+        fcols  = [c for c in imp_df.columns if imp_df[c].dtype == float]
+        styled = (
+            imp_df.style
+            .format({c: '{:.4f}' for c in fcols})
+            .background_gradient(
+                subset=['avg_objective'] if 'avg_objective' in imp_df.columns else [],
+                cmap='RdYlGn_r')
+            .background_gradient(
+                subset=['avg_train_val_acc'] if 'avg_train_val_acc' in imp_df.columns else [],
+                cmap='RdYlGn')
+            .background_gradient(
+                subset=['avg_val_acc_delta'] if 'avg_val_acc_delta' in imp_df.columns else [],
+                cmap='RdYlGn')
+            .set_caption(f"Marginal HP Impact — {self.study_name}")
+            .set_table_styles([{
+                'selector': 'th',
+                'props': [('background-color','#2c3e50'),('color','white'),
+                          ('padding','6px 10px'),('font-size','12px')]
+            },{
+                'selector': 'td',
+                'props': [('padding','4px 8px'),('font-size','11px')]
+            }])
+        )
+        self._save_df_html(styled, 'marginal_impact')
+
+    # ------------------------------------------------------------------
+    # 4. Optuna optimization history
+    # ------------------------------------------------------------------
+
+    def plot_opt_history(self):
+        """
+        Objective value per trial with best-so-far line. Optuna built-in.
+
+        Shows how the objective improved over trials — useful to see:
+            - When TPE found the best region (steep drop)
+            - Whether the search had converged by end of budget
+            - How many trials were needed to reach near-optimal
+
+        Works without log_path — uses raw Optuna study data.
+        """
+        self._check_loaded()
+        import optuna.visualization as vis
+        fig = vis.plot_optimization_history(self.study)
+        fig.update_layout(title=f'{self.study_name} — Optimization History')
+        self._save_html(fig, 'opt_history')
+
+    # ------------------------------------------------------------------
+    # 5. Learning curves — epoch-level pruning view
+    # ------------------------------------------------------------------
+
+    def plot_learning_curves(self):
+        """
+        Per-trial intermediate val_loss values reported at each epoch.
+        Shows epoch-level curves for all trials including pruned ones.
+
+        Useful for:
+            - Seeing at which epochs Hyperband pruned trials
+            - Comparing convergence speed across different HP combos
+            - Identifying trials that degraded early vs improved steadily
+
+        Pruned trials appear as short lines ending at the pruning epoch.
+        Completed trials extend to proxy_epochs (30 in final run).
+        Works without log_path.
+        """
+        self._check_loaded()
+        import optuna.visualization as vis
+        fig = vis.plot_intermediate_values(self.study)
+        fig.update_layout(
+            title      = f'{self.study_name} — Learning Curves (epoch-level)',
+            xaxis_title= 'Epoch',
+            yaxis_title= 'val_loss (objective)',
+            showlegend = False,
+        )
+        best_val = self.study.best_value
+        fig.add_hline(
+            y                  = best_val,
+            line_dash          = 'dot',
+            line_color         = 'green',
+            annotation_text    = f'best: {best_val:.4f}',
+            annotation_position= 'right',
+        )
+        self._save_html(fig, 'learning_curves')
+
+    # ------------------------------------------------------------------
+    # 6. HP trend — box plots per HP value
+    # ------------------------------------------------------------------
+
+    def plot_hp_trend(self, metric: str = 'objective'):
+        """
+        Box plots showing metric distribution per unique HP value.
+        One subplot per HP — all HPs in a single figure.
+
+        Complements report_marginal_impact:
+            marginal_impact → exact mean/best numbers (table)
+            plot_hp_trend   → spread and variance per value (visual)
+
+        Only completed trials (non-nan metric values) are included.
+        Requires log_path for HP decoding.
+
+        Args:
+            metric : column to analyse — 'objective', 'train_val_acc',
+                     or 'val_acc_delta'
+        """
+        self._check_loaded()
+        hp_cols = self._hp_cols()
+        if not hp_cols:
+            print("  plot_hp_trend requires log_path for HP decoding.")
+            return
+        if metric not in self._df.columns:
+            print(f"  metric '{metric}' not in DataFrame.")
+            return
+
+        from math import ceil
+        import plotly.subplots as ps
+
+        n    = len(hp_cols)
+        cols = min(3, n)
+        rows = ceil(n / cols)
+        fig  = ps.make_subplots(rows=rows, cols=cols, subplot_titles=hp_cols)
+        is_delta = 'delta' in metric.lower()
+
+        for i, hp in enumerate(hp_cols):
+            r = i // cols + 1
+            c = i %  cols + 1
+            df_hp = self._df[[hp, metric]].dropna()
+            for val in sorted(df_hp[hp].unique(), key=str):
+                vals = df_hp[df_hp[hp] == val][metric].tolist()
+                fig.add_trace(
+                    self._go.Box(y=vals, name=str(val), boxmean=True),
+                    row=r, col=c
+                )
+
+        if is_delta:
+            fig.add_hline(y=0, line_dash='dash', line_color='black')
+
+        fig.update_layout(
+            title      = f'{self.study_name} — HP Trend: {metric} per HP value',
+            height     = 380 * rows,
+            showlegend = False,
+        )
+        self._save_html(fig, f'hp_trend_{metric}')
+
+    # ------------------------------------------------------------------
+    # 7. Individual HP importance — Spearman correlation bar chart
+    # ------------------------------------------------------------------
+
+    def plot_individual_importance(self,
+                                   hp_list: list = None,
+                                   metric:  str  = 'objective'):
+        """
+        Ranked horizontal bar chart of HP importance measured by absolute
+        Spearman rank correlation between HP value and the metric.
+
+        Spearman correlation is used (not Pearson) because:
+            - HP values are ordinal/categorical (rkd: 0/1/5 — not linear)
+            - Spearman measures monotonic relationship, not linear
+            - More robust to outliers from pruned trials
+
+        Absolute value used — direction (positive/negative) is visible
+        from report_marginal_impact; this plot shows magnitude only.
+
+        Only completed trials (non-nan metric) are included.
+        Requires log_path for HP decoding.
+
+        Args:
+            hp_list : subset of HP names to include — None includes all
+                      e.g. ['joint_loss_alpha_rkd', 'warm_start']
+            metric  : 'objective', 'train_val_acc', or 'val_acc_delta'
+        """
+        self._check_loaded()
+        all_hps = self._hp_cols()
+        if not all_hps:
+            print("  plot_individual_importance requires log_path for HP decoding.")
+            return
+
+        target_hps = [h for h in (hp_list or all_hps) if h in all_hps]
+        if hp_list:
+            missing = set(hp_list) - set(target_hps)
+            if missing:
+                print(f"  Warning: HPs not found in decoded data: {missing}")
+        if not target_hps:
+            print("  No valid HPs to plot.")
+            return
+
+        if metric not in self._df.columns:
+            print(f"  metric '{metric}' not in DataFrame.")
+            return
+
+        df_corr = self._df[target_hps + [metric]].dropna()
+        if df_corr.empty:
+            print("  No complete trials available for correlation.")
+            return
+
+        df_corr = self._encode_hps_numeric(df_corr, target_hps)
+
+        corrs = (
+            df_corr[target_hps]
+            .corrwith(df_corr[metric], method='spearman')
+            .abs()
+            .sort_values(ascending=True)
+        )
+
+        fig = self._px.bar(
+            x           = corrs.values,
+            y           = corrs.index,
+            orientation = 'h',
+            title       = f'{self.study_name} — HP Importance: |Spearman| vs {metric}',
+            labels      = {'x': f'|Spearman correlation| with {metric}',
+                           'y': 'Hyperparameter'},
+            color       = corrs.values,
+            color_continuous_scale = 'Teal',
+        )
+        fig.update_layout(
+            height     = max(300, 50 * len(target_hps)),
+            showlegend = False,
+            coloraxis_showscale = False,
+        )
+        self._save_html(fig, f'hp_importance_{metric}')
+
+    def plot_hp_correlation(self, metrics: list = None):
+        """
+        Single global heatmap — Spearman rank correlation between each HP and
+        each metric. Rows = HPs, cols = metrics.
+
+        Spearman used (not Pearson) — HP values are ordinal/categorical,
+        not linearly spaced. Spearman measures monotonic relationship correctly.
+
+        Color interpretation:
+            objective     — negative (red) = HP raises loss = bad
+                            positive (green) = HP lowers loss = good
+            train_val_acc — positive (green) = HP raises acc = good
+                            negative (red) = HP lowers acc = bad
+
+        Note: bool HPs (warm_start) encoded as False=0, True=1.
+
+        Requires log_path for HP decoding.
+
+        Args:
+            metrics : list of metric columns to correlate against
+                    defaults to ['objective', 'train_val_acc']
+                    pass any subset e.g. ['val_acc_delta'] for single metric
+        """
+        self._check_loaded()
+        hp_cols = self._hp_cols()
+        if not hp_cols:
+            print("  plot_hp_correlation requires log_path for HP decoding.")
+            return
+
+        if metrics is None:
+            metrics = ['objective', 'train_val_acc']
+
+        metrics = [m for m in metrics if m in self._df.columns]
+        if not metrics:
+            print(f"  None of the requested metrics found in DataFrame.")
+            return
+
+        df = self._df[hp_cols + metrics].dropna()
+        if df.empty:
+            print("  No complete trials for correlation.")
+            return
+
+        df   = self._encode_hps_numeric(df, hp_cols)
+        corr = df[hp_cols + metrics].corr(method='spearman').loc[hp_cols, metrics]
+
+        z      = corr.values.tolist()
+        x_labs = list(corr.columns)
+        y_labs = list(corr.index)
+        text   = [[f'{v:.3f}' for v in row] for row in z]
+
+        fig = self._go.Figure(self._go.Heatmap(
+            z            = z,
+            x            = x_labs,
+            y            = y_labs,
+            colorscale   = 'RdYlGn',
+            zmid         = 0,
+            zmin         = -1,
+            zmax         = 1,
+            colorbar     = dict(title='Spearman r'),
+            text         = text,
+            texttemplate = '%{text}',
+        ))
+        fig.update_layout(
+            title       = f'{self.study_name} — HP × Metric Spearman Correlation',
+            xaxis_title = 'Metric',
+            yaxis_title = 'Hyperparameter',
+            height      = max(300, 60 * len(hp_cols)),
+            width       = 500,
+        )
+        self._save_html(fig, 'hp_correlation')
