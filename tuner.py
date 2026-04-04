@@ -923,6 +923,7 @@ class HPStudyAnalyzer:
                  db_path:    str,
                  logs_dir:   str = 'tune_logs',
                  log_path:   str = None,
+                 plots_dir:  str = 'tune_plots',  # ← ADD: where HTML reports go
                  phase:      str = 'train'):
         """
         Args:
@@ -948,12 +949,14 @@ class HPStudyAnalyzer:
         self.db_path    = db_path
         self.logs_dir   = logs_dir
         self.log_path   = log_path
+        self.plots_dir = plots_dir
         self.phase      = phase
         self.study      = None
         self._df        = None
-        self._prefix    = os.path.join(logs_dir, f"tuner.{run_id}_{study_name}")
+        self._prefix    = os.path.join(plots_dir, f"tuner.{run_id}_{study_name}")
 
         os.makedirs(logs_dir, exist_ok=True)
+        os.makedirs(plots_dir, exist_ok=True)   # ← create plots_dir not logs_dir
 
         try:
             import optuna

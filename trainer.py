@@ -62,36 +62,6 @@ Hyperparameters (TrainConfig):
 - joint_loss_temp: Temperature scaling for RKD distance matrices.
 - joint_loss_lca_var: Softness constant (variance) for student LCA distribution.
 
-Elastic Weight Consolidation (EWC)
-
-The primary experimental finding of this study is that the train phase 
-consistently degrades novel class generalisation across all 6 runs — 
-proto_novel drops from pretrain level in every architecture and paradigm 
-combination. EWC directly addresses this by constraining backbone weights 
-to stay close to the pretrain checkpoint during the train phase, weighted 
-by their importance to pretrain performance.
-
-Implementation requires:
-  1. After pretrain() — estimate Fisher information via 50-batch 
-     forward pass on pretrain pool (~2 min)
-  2. Store pretrain checkpoint weights as frozen reference θ*
-  3. During train phase — add EWC penalty to every loss computation:
-     total_loss = task_loss + λ * Σ F_i * (θ_i - θ*_i)²
-
-Expected benefit: proto_novel accuracy maintained near pretrain level 
-(~0.82-0.86 proto_seen quality) rather than degrading to 0.63-0.69 
-as observed in Run 2. This would validate the pretrain checkpoint as 
-the optimal starting point for novel class generalisation and confirm 
-that the train phase degrades rather than improves novel class features.
-
-λ tuning required: start at λ=1000, reduce if train loss cannot improve.
-Complementary to existing L2 regularisation (weight_decay) — addresses
-a different problem (forgetting vs overfitting) and should be used 
-alongside weight_decay, not as a replacement.
-
-Reference: Kirkpatrick, J. et al. (2017). Overcoming catastrophic 
-forgetting in neural networks. PNAS, 114(13), 3521–3526.
-
 Required Libraries
 ------------------
 # torch>=2.0.0
@@ -166,7 +136,6 @@ class TrainConfig:
     lr_map:               Optional[Dict[str, float]] = None
 
     # ── Train phase improvements (all default to disabled = current behaviour) ──
-    ewc_lambda:       float = 0.0    # EWC penalty weight — 0.0 = disabled
     freeze_n_epochs:  int   = 0      # freeze backbone's first N train epochs — 0 = disabled
     warm_start:       bool  = True   # init train early-stop from pretrain best using zero shot anchor validation — False = reset
 
@@ -179,7 +148,7 @@ class TrainConfig:
     #   -> Weight for statistical identity. Start at 0.5; higher values enforce stricter class-identity preservation.
     joint_loss_alpha_lca: float = 0.0    
 
-    #   joint_loss_alpha_rkd: [0.1 - 1.0] 
+    #   joint_loss_alpha_rkd: [0.1 - 10.0 | 5.0 being optimum as found by tuner] 
     #   -> Weight for structural topology. Distills relative distances between samples.
     #       Highly effective for GAT relational learning.
     joint_loss_alpha_rkd: float = 0.0    
@@ -314,10 +283,6 @@ class TrainingState:
     is_pretrained:        bool  = False
     is_trained:           bool  = False
 
-    # EWC - Runtime tensors — populated during training, excluded from JSON serialization
-    fisher_diag:          Any   = field(default=None, repr=False)  # dict{name: tensor} — EWC Fisher
-    pretrain_weights:     Any   = field(default=None, repr=False)  # dict{name: tensor} — EWC reference
-
     # LCA Anchors: Only store the raw tensors for checkpointing 
     # (Latent Centroid Anchoring - class wide mean/variance for KL divergence)
     # Shape: [90, 640]
@@ -330,8 +295,6 @@ class TrainingState:
         
         # 2. List of keys that contain Tensors (Non-JSON serializable)
         tensor_keys = (
-            'fisher_diag', 
-            'pretrain_weights', 
             'class_means',   # Added for LCA
             'class_vars'     # Added for LCA
         )
@@ -719,10 +682,6 @@ class TrainerImpl:
             self.state.class_means = means
             self.state.class_vars  = vars
 
-        # Initialize EWC Fisher
-        if self.config.ewc_lambda > 0:
-            self._compute_fisher()
-
 
     def load_pretrain(self, path: str):
         """
@@ -753,10 +712,6 @@ class TrainerImpl:
         if self.config.joint_loss_alpha_lca > 0 and self.state.class_means is None:
             means, vars = self._compute_lca_stats()
             self.state.class_means, self.state.class_vars = means, vars
-
-        # Initialize EWC Fisher if missing
-        if self.config.ewc_lambda > 0 and self.state.fisher_diag is None:
-            self._compute_fisher()
 
         print(f"\n  Phase 1: Pretrain weights loaded from {path}")
 
@@ -974,8 +929,7 @@ class TrainerImpl:
             epochs_run = epoch + 1
 
             # freeze_n_epochs: freeze backbone for first N epochs, unfreeze after
-            # mutual exclusion with EWC — if EWC active, freeze_n ignored
-            if self.config.ewc_lambda == 0 and self.config.freeze_n_epochs > 0:
+            if self.config.freeze_n_epochs > 0:
                 if epoch == 0:
                     self.model.freeze('backbone')
                 elif epoch == self.config.freeze_n_epochs:
@@ -1034,7 +988,7 @@ class TrainerImpl:
                 break
 
         # Ensure backbone unfrozen after train loop (in case freeze_n >= epochs_train)
-        if self.config.ewc_lambda == 0 and self.config.freeze_n_epochs > 0:
+        if self.config.freeze_n_epochs > 0:
             self.model.unfreeze('backbone')
 
         elapsed = (time.time() - self._phase_start_time) / 60
@@ -1074,9 +1028,6 @@ class TrainerImpl:
                 loss = self._criterion(logits, labels)
 
                 if should_optimize:
-                    if self.config.ewc_lambda > 0:
-                        loss += self.config.ewc_lambda * self._ewc_penalty()
-
                     if self.config.joint_loss_alpha_lca > 0 or self.config.joint_loss_alpha_rkd > 0:
                         emb = self.model(imgs, mode='embedding')
                         loss += self.joint_loss_manager.compute_loss(
@@ -1150,9 +1101,6 @@ class TrainerImpl:
                 loss = self._criterion(dists, target)
 
                 if should_optimize:
-                    if self.config.ewc_lambda > 0:
-                        loss += self.config.ewc_lambda * self._ewc_penalty()
-
                     if self.config.joint_loss_alpha_lca > 0 or self.config.joint_loss_alpha_rkd > 0:
                         # Retrieve the aligned global IDs from our new Collator logic
                         global_ids = batch.get('targets_global', None)
@@ -1329,50 +1277,6 @@ class TrainerImpl:
         print(f"  LCA: Computed {active_anchors}/{num_classes} valid anchors (Dropped {num_classes-active_anchors} sparse classes)")
         return means.to(self.device), vars.to(self.device)
 
-    def _compute_fisher(self):
-        """
-        Compute diagonal Fisher information matrix over pretrain val_seen.
-        Called once at end of pretrain() when ewc_lambda > 0.
-        Stores fisher_diag and pretrain_weights in self.state.
-        """
-        loader = self.factory.get_loader(
-            'val_seen', mode='batch',
-            batch_size  = self.config.batch_size,
-            num_workers = self.config.num_workers
-        )
-        self.model.eval()
-        fisher = {n: torch.zeros_like(p) for n, p in self.model.named_parameters()
-                  if p.requires_grad}
-        n_batches = 0
-        for imgs, labels in loader:
-            imgs, labels = imgs.to(self.device), labels.to(self.device)
-            self.model.zero_grad()
-            logits = self.model(imgs, mode='linear')
-            loss   = torch.nn.functional.cross_entropy(logits, labels)
-            loss.backward()
-            for n, p in self.model.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    fisher[n] += p.grad.detach() ** 2
-            n_batches += 1
-        for n in fisher:
-            fisher[n] /= max(n_batches, 1)
-        self.state.fisher_diag     = fisher
-        self.state.pretrain_weights = {n: p.detach().clone()
-                                       for n, p in self.model.named_parameters()
-                                       if p.requires_grad}
-
-    def _ewc_penalty(self) -> torch.Tensor:
-        """EWC regularisation penalty — sum of Fisher-weighted squared weight drift."""
-        penalty = torch.tensor(0.0, device=self.device)
-        if self.state.fisher_diag is None:
-            return penalty
-        for n, p in self.model.named_parameters():
-            if n in self.state.fisher_diag:
-                penalty = penalty + (
-                    self.state.fisher_diag[n] *
-                    (p - self.state.pretrain_weights[n]) ** 2
-                ).sum()
-        return penalty
 
     def _load_pretrain_best(self):
         """
